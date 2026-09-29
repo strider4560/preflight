@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from preflight.outcome import Status
 from preflight.render import (
     open_steps,
     render_check,
+    render_status,
     report_json,
     run_json,
     to_junit,
@@ -208,6 +210,100 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    started = _now()
+    try:
+        gates_dir, contracts_dir = _defaults(args)
+        all_gates = load_directory(gates_dir)
+        repository, environments = _load_contracts(contracts_dir)
+        _validate_all(all_gates, repository, environments)
+        milestones = [g for g in all_gates if g.milestone]
+        repository_gates = [g for g in milestones if g.scope == "repository"]
+        environment_gates = [g for g in milestones if g.scope == "environment"]
+        runs = []
+        if repository_gates and repository is not None:
+            runs.append(("repository", repository_gates, {"repository": repository}))
+        for contract in environments:
+            if environment_gates:
+                contracts = {"environment": contract}
+                if repository is not None:
+                    contracts["repository"] = repository
+                runs.append((contract.environment or "", environment_gates, contracts))
+        plans = [
+            (label, gates, build_plan(gates, contracts, link_gates=False, strict=False))
+            for label, gates, contracts in runs
+        ]
+    except INVALID as exc:
+        return _report_invalid(exc)
+
+    repository_names = {g.name for g in repository_gates}
+    satisfied: dict[tuple[str, str], bool] = {}
+    sections, main_steps, also_steps, json_runs = [], [], [], []
+    changed: set[str] = set()
+    inputs: dict[str, str] = {}
+    for label, gates, plan in plans:
+        results = run_plan(plan, jobs=args.jobs)
+        rows, main_nodes, also_nodes = [], set(), set()
+        for gate in gates:
+            nodes = plan.nodes_of(gate.name)
+            own_ok = all(results[n.id].status is Status.OK for n in nodes)
+            waits = [
+                r
+                for r in gate.requires
+                if not satisfied.get(("repository" if r in repository_names else label, r), True)
+            ]
+            satisfied[(label, gate.name)] = own_ok and not waits
+            if waits:
+                state = "waiting"
+                also_nodes.update(n.id for n in nodes)
+            elif own_ok:
+                state = "satisfied"
+            else:
+                count = len(open_steps({n.id: results[n.id] for n in nodes}))
+                state = f"open ({count})"
+                main_nodes.update(n.id for n in nodes)
+            rows.append((state, gate.name, waits))
+            json_runs.append(
+                run_json(
+                    gate.name,
+                    plan.contracts[gate.scope].environment,
+                    [results[n.id] for n in nodes if n.owner == gate.name],
+                )
+            )
+        also_nodes -= main_nodes
+
+        def prefixed(node_ids: set[str], results=results, label=label):
+            steps = open_steps({k: v for k, v in results.items() if k in node_ids})
+            return [replace(step, item_id=f"{label}: {step.item_id}") for step in steps]
+
+        main_steps += prefixed(main_nodes)
+        also_steps += prefixed(also_nodes)
+        sections.append((label, rows))
+        for contract in plan.contracts.values():
+            changed.update(contract.changed_inputs())
+        inputs.update(plan.inputs)
+
+    exit_code = 0 if all(satisfied.values()) and not changed else 1
+    sys.stdout.write(render_status(sections, main_steps, also_steps))
+    if changed:
+        print(f"\nInputs changed during the run: {', '.join(sorted(changed))}. Rerun.")
+    if args.json:
+        write_json(
+            args.json,
+            report_json(
+                command="status",
+                exit_code=exit_code,
+                started=started,
+                finished=_now(),
+                inputs=inputs,
+                runs=json_runs,
+                steps=main_steps + also_steps,
+                inputs_changed=sorted(changed),
+            ),
+        )
+    return exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="preflight", description="Operator guardrails that name the next step."
@@ -227,17 +323,13 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--contracts", type=Path)
     status.add_argument("--json", type=Path)
     status.add_argument("--jobs", type=_positive_int, default=4)
-    status.set_defaults(handler=lambda args: cmd_status(args))
+    status.set_defaults(handler=cmd_status)
 
     validate = commands.add_parser("validate", help="load every gate and contract; observe nothing")
     validate.add_argument("--gates", type=Path)
     validate.add_argument("--contracts", type=Path)
     validate.set_defaults(handler=cmd_validate)
     return parser
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    raise NotImplementedError  # Task 18
 
 
 def main(argv: list[str] | None = None) -> int:

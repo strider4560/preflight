@@ -273,3 +273,27 @@ def to_junit(name: str, results: Mapping[str, NodeResult]) -> str:
     suite.set("failures", str(failures))
     suite.set("errors", str(errors))
     return ElementTree.tostring(suite, encoding="unicode", xml_declaration=True) + "\n"
+
+
+def render_status(
+    sections: Sequence[tuple[str, Sequence[tuple[str, str, Sequence[str]]]]],
+    main_steps: Sequence[OpenStep],
+    also_steps: Sequence[OpenStep],
+) -> str:
+    lines = ["preflight status"]
+    for label, rows in sections:
+        lines += ["", label]
+        for state, name, waits in rows:
+            suffix = f"  (waits on {', '.join(waits)})" if waits else ""
+            lines.append(f"  {state:<10} {name}{suffix}")
+    lines.append("")
+    if main_steps:
+        lines += ["Open steps:", *render_steps(main_steps)]
+    elif also_steps:
+        lines.append("Nothing open outside gates still waiting.")
+    else:
+        lines.append("Nothing open.")
+    if also_steps:
+        lines += ["", "Also open, in gates still waiting:"]
+        lines += render_steps(also_steps, first_is_next=False)
+    return "\n".join(lines) + "\n"
