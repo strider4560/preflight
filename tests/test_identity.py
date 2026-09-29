@@ -75,3 +75,30 @@ def test_aws_assumed_keeps_the_callers_credentials():
     assert env["AWS_ACCESS_KEY_ID"] == "key"
     assert env["AWS_PROFILE"] == "production"
     assert env["AWS_REGION"] == "us-east-1"
+
+
+def test_a_missing_or_empty_path_never_adds_the_current_directory():
+    for base in ({}, {"PATH": ""}):
+        env = worker_environment(base, None, keep_aws=False, bin_dir="/venv/bin")
+        assert env["PATH"] == "/venv/bin"
+
+
+REDIRECTS = {
+    "AWS_ENDPOINT_URL": "http://evil",
+    "AWS_ENDPOINT_URL_STS": "http://evil",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/x",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://evil",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN": "t",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/t",
+}
+
+
+def test_redirecting_variables_are_dropped_unless_aws_is_kept():
+    base = {"PATH": "/usr/bin", "AWS_CONFIG_FILE": "/cfg", "TF_VAR_x": "1", **REDIRECTS}
+    scrubbed = worker_environment(base, Identity(**SPEC), keep_aws=False, bin_dir="/b")
+    assert not set(REDIRECTS) & set(scrubbed)
+    assert scrubbed["AWS_CONFIG_FILE"] == "/cfg"
+    kept = worker_environment(base, Identity(**SPEC), keep_aws=True, bin_dir="/b")
+    assert all(kept[name] == value for name, value in REDIRECTS.items())
+    assert kept["AWS_CONFIG_FILE"] == "/cfg"
+    assert "TF_VAR_x" not in kept

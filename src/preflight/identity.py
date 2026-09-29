@@ -25,7 +25,13 @@ AWS_VARIABLES = (
     "AWS_ROLE_ARN",
     "AWS_ROLE_SESSION_NAME",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ENDPOINT_URL",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
 )
+AWS_PREFIXES = ("AWS_ENDPOINT_URL_",)
 TOFU_VARIABLES = ("TF_CLI_ARGS", "TF_WORKSPACE")
 TOFU_PREFIXES = ("TF_CLI_ARGS_", "TF_VAR_")
 ASSUMED_ROLE = re.compile(r"^arn:aws[a-z-]*:sts::(\d{12}):assumed-role/([^/]+)/.+$")
@@ -71,8 +77,9 @@ def worker_environment(
 ) -> dict[str, str]:
     env = dict(base)
     if not keep_aws:
-        for name in AWS_VARIABLES:
-            env.pop(name, None)
+        for name in list(env):
+            if name in AWS_VARIABLES or name.startswith(AWS_PREFIXES):
+                del env[name]
     for name in list(env):
         if name in TOFU_VARIABLES or name.startswith(TOFU_PREFIXES):
             del env[name]
@@ -81,5 +88,5 @@ def worker_environment(
             env["AWS_PROFILE"] = identity.profile
         env["AWS_REGION"] = identity.region
         env["AWS_DEFAULT_REGION"] = identity.region
-    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    env["PATH"] = os.pathsep.join(part for part in (bin_dir, env.get("PATH", "")) if part)
     return env
