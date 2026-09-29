@@ -16,6 +16,7 @@ import dns.query
 import dns.rcode
 import dns.rdatatype
 import dns.resolver
+import dns.rrset
 
 
 class DnsUnavailable(Exception):
@@ -44,9 +45,9 @@ class SystemTransport:
         return response
 
     def resolve(self, name: str, rdtype: str) -> list[str]:
-        resolver = dns.resolver.Resolver()
-        resolver.lifetime = 5.0
         try:
+            resolver = dns.resolver.Resolver()
+            resolver.lifetime = 5.0
             answer = resolver.resolve(name, rdtype)
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
             return []
@@ -79,24 +80,49 @@ class DnsClient:
         query = dns.message.make_query(name, dns.rdatatype.NS)
         query.flags &= ~dns.flags.RD
         target = dns.name.from_text(name)
+        usable: set[Referral] = set()
         for address in self.parent_addresses(parent):
             try:
                 response = self.transport.query(query, address, self.timeout)
             except (dns.exception.DNSException, OSError):
                 continue
-            code = response.rcode()
-            if code == dns.rcode.NXDOMAIN:
-                return Referral("none", frozenset())
-            if code != dns.rcode.NOERROR:
-                continue
-            for rrset in response.authority:
-                if rrset.rdtype == dns.rdatatype.NS and rrset.name == target:
-                    return Referral("referral", frozenset(norm(r.target.to_text()) for r in rrset))
-            return Referral("none", frozenset())
-        raise DnsUnavailable(f"no server for {parent} answered about {name}")
+            answer = _usable(response, target)
+            if answer is not None:
+                usable.add(answer)
+        if not usable:
+            raise DnsUnavailable(f"no server for {parent} answered about {name}")
+        if len(usable) > 1:
+            raise DnsUnavailable(f"parent servers disagree about {name}")
+        return usable.pop()
 
     def cname(self, name: str) -> list[str]:
         return [norm(target) for target in self.transport.resolve(name, "CNAME")]
 
     def caa(self, name: str) -> list[str]:
         return self.transport.resolve(name, "CAA")
+
+
+def _has_ns(section: list, target: dns.name.Name) -> dns.rrset.RRset | None:
+    for rrset in section:
+        if rrset.rdtype == dns.rdatatype.NS and rrset.name == target:
+            return rrset
+    return None
+
+
+def _usable(response: dns.message.Message, target: dns.name.Name) -> Referral | None:
+    """The parent's verdict, or None when the response cannot support one."""
+    code = response.rcode()
+    authoritative = bool(response.flags & dns.flags.AA)
+    if _has_ns(response.answer, target) is not None:
+        return None
+    if code == dns.rcode.NXDOMAIN:
+        return Referral("none", frozenset()) if authoritative else None
+    if code != dns.rcode.NOERROR:
+        return None
+    delegation = _has_ns(response.authority, target)
+    if delegation is not None:
+        return Referral("referral", frozenset(norm(r.target.to_text()) for r in delegation))
+    has_soa = any(r.rdtype == dns.rdatatype.SOA for r in response.authority)
+    if authoritative and has_soa:
+        return Referral("none", frozenset())
+    return None

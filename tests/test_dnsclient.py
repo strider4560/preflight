@@ -49,9 +49,33 @@ def rcode(code):
     def answer(query):
         response = dns.message.make_response(query)
         response.set_rcode(code)
+        if code == dns.rcode.NXDOMAIN:
+            response.flags |= dns.flags.AA
         return response
 
     return answer
+
+
+def nodata(query):
+    response = dns.message.make_response(query)
+    response.flags |= dns.flags.AA
+    response.authority.append(
+        dns.rrset.from_text("tellabs.dev.", 300, "IN", "SOA", "ns-a.example. h.example. 1 2 3 4 5")
+    )
+    return response
+
+
+def lame(query):
+    return dns.message.make_response(query)
+
+
+def child_answer(query):
+    response = dns.message.make_response(query)
+    response.flags |= dns.flags.AA
+    response.answer.append(
+        dns.rrset.from_text("app.tellabs.dev.", 300, "IN", "NS", "ns-1.example.")
+    )
+    return response
 
 
 def test_norm():
@@ -59,7 +83,8 @@ def test_norm():
 
 
 def test_reads_the_referral_from_the_authority_section_without_recursion():
-    transport = FakeTransport(responses={"192.0.2.1": referral("NS-1.example.", "ns-2.example.")})
+    both = referral("NS-1.example.", "ns-2.example.")
+    transport = FakeTransport(responses={"192.0.2.1": both, "192.0.2.2": both})
     result = DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
     assert result == Referral("referral", frozenset({"ns-1.example", "ns-2.example"}))
     server, message = transport.queries[0]
@@ -68,8 +93,8 @@ def test_reads_the_referral_from_the_authority_section_without_recursion():
 
 
 def test_nxdomain_and_an_empty_authority_mean_no_delegation():
-    for answer in (rcode(dns.rcode.NXDOMAIN), rcode(dns.rcode.NOERROR)):
-        transport = FakeTransport(responses={"192.0.2.1": answer})
+    for answer in (rcode(dns.rcode.NXDOMAIN), nodata):
+        transport = FakeTransport(responses={"192.0.2.1": answer, "192.0.2.2": answer})
         assert DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev").kind == "none"
 
 
@@ -105,3 +130,35 @@ def test_cname_and_caa():
     assert client.cname("vault.tellabs.dev") == ["vault.app.tellabs.dev"]
     assert client.caa("tellabs.dev") == ['0 issue "amazon.com"']
     assert client.cname("missing.tellabs.dev") == []
+
+
+def test_a_plain_empty_noerror_is_not_a_verdict():
+    transport = FakeTransport(responses={"192.0.2.1": rcode(dns.rcode.NOERROR), "192.0.2.2": lame})
+    with pytest.raises(DnsUnavailable):
+        DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
+
+
+def test_a_lame_server_is_skipped_for_a_real_referral():
+    transport = FakeTransport(responses={"192.0.2.1": lame, "192.0.2.2": referral("ns-1.example.")})
+    result = DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
+    assert result == Referral("referral", frozenset({"ns-1.example"}))
+
+
+def test_all_servers_lame_is_unavailable():
+    transport = FakeTransport(responses={"192.0.2.1": lame, "192.0.2.2": lame})
+    with pytest.raises(DnsUnavailable):
+        DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
+
+
+def test_an_ns_rrset_only_in_the_answer_section_is_unusable():
+    transport = FakeTransport(responses={"192.0.2.1": child_answer, "192.0.2.2": child_answer})
+    with pytest.raises(DnsUnavailable):
+        DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
+
+
+def test_disagreeing_parent_servers_are_unavailable():
+    transport = FakeTransport(
+        responses={"192.0.2.1": referral("ns-1.example."), "192.0.2.2": rcode(dns.rcode.NXDOMAIN)}
+    )
+    with pytest.raises(DnsUnavailable, match="disagree"):
+        DnsClient(transport).referral("app.tellabs.dev", "tellabs.dev")
