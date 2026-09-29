@@ -118,3 +118,18 @@ def test_paths_outside_the_repository_are_refused(tmp_path):
     write(tmp_path, "outside.yaml", "a: 1\n")
     with pytest.raises(ResolveError, match="outside the repository"):
         resolve(tmp_path / "repo", {"yaml": "../outside.yaml"})
+
+
+def test_yaml_glob_stays_inside_the_repository(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write(tmp_path, "outside.yaml", "a: 1\n")
+    (repo / "link.yaml").symlink_to(tmp_path / "outside.yaml")
+    for pattern in ("../*.yaml", str(tmp_path / "*.yaml"), "*.yaml"):
+        with pytest.raises(ResolveError, match="outside the repository"):
+            resolve(repo, {"yaml_glob": pattern})
+
+
+def test_ssm_name_with_a_trailing_newline_is_refused():
+    with pytest.raises(ResolveError, match="parameter name"):
+        parse_reference({"ssm": "/x\n", "identity": "admin"})

@@ -90,7 +90,7 @@ def parse_reference(table: Mapping[str, Any]) -> Reference | None:
     if source == "tfvars" and not isinstance(table.get("key"), str):
         raise ResolveError("a tfvars reference needs key")
     if source == "ssm":
-        if not SSM_NAME.match(target):
+        if not SSM_NAME.fullmatch(target):
             raise ResolveError(f"{target!r} is not an SSM parameter name")
         if not isinstance(table.get("identity"), str):
             raise ResolveError("an ssm reference needs identity")
@@ -159,12 +159,23 @@ class Resolver:
                 ref.how,
             )
         if ref.source == "yaml_glob":
+            pattern = ref.target
+            if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                raise ResolveError(f"{pattern} is outside the repository")
+            matches = []
+            for match in self.root.glob(pattern):
+                resolved = match.resolve()
+                if not resolved.is_relative_to(self.root):
+                    relative = match.relative_to(self.root).as_posix()
+                    raise ResolveError(f"{relative} is outside the repository")
+                if resolved.is_file():
+                    matches.append(resolved)
             return [
                 {
                     "file": path.relative_to(self.root).as_posix(),
                     "value": dotted_get(self._load(path, "yaml"), ref.options.get("path")),
                 }
-                for path in sorted(p.resolve() for p in self.root.glob(ref.target) if p.is_file())
+                for path in sorted(matches)
             ]
         document = self._load(self._path(ref.target), ref.source)
         if ref.source == "tfvars":
