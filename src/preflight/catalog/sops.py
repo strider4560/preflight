@@ -33,15 +33,26 @@ def rule(ctx, s: SopsRuleSection) -> Outcome:
         )
         return outcome(
             fail(
-                do=f"Create {s.config} with a creation rule for each secrets file.",
+                do=f"Create {s.config} at the repository root containing:",
                 paste=skeleton,
                 generic=True,
             )
         )
     try:
-        rules = (yaml.safe_load(config.content_string) or {}).get("creation_rules") or []
+        loaded = yaml.safe_load(config.content_string) or {}
     except yaml.YAMLError:
         return outcome(error(do=f"{s.config} is not valid YAML.", error_type="YAMLError"))
+    rules = (loaded.get("creation_rules") or []) if isinstance(loaded, dict) else None
+    if not isinstance(rules, list):
+        return outcome(
+            error(
+                do=(
+                    f"{s.config} does not have the sops shape "
+                    "(a mapping with a creation_rules list)."
+                ),
+                error_type="YAMLError",
+            )
+        )
     rules = [r for r in rules if isinstance(r, dict)]
     items = []
     for path in s.paths:

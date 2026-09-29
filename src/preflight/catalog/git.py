@@ -3,6 +3,8 @@ never fetches, so checking changes nothing."""
 
 from __future__ import annotations
 
+import shlex
+
 from preflight.check import Section, check
 from preflight.outcome import Outcome, error, fail, ok, outcome
 
@@ -16,9 +18,16 @@ class UpToDateSection(Section):
 def up_to_date(ctx, s: UpToDateSection) -> Outcome:
     root = str(ctx.root)
     ref = f"{s.remote}/{s.branch}"
-    paste = f"git fetch {s.remote} && git rebase {ref}"
-    remote = ctx.host.run("git -C %s ls-remote %s %s", root, s.remote, f"refs/heads/{s.branch}")
-    if remote.rc != 0 or not remote.stdout.strip():
+    paste = f"git fetch {shlex.quote(s.remote)} && git rebase {shlex.quote(ref)}"
+    remote = ctx.host.run(
+        "env GIT_TERMINAL_PROMPT=0 git -C %s ls-remote %s %s",
+        root,
+        s.remote,
+        f"refs/heads/{s.branch}",
+    )
+    if remote.rc == 0 and not remote.stdout.strip():
+        return outcome(fail(do=f"Branch {s.branch} does not exist on {s.remote}.", generic=True))
+    if remote.rc != 0:
         return outcome(
             error(
                 do=f"Could not read {ref} from the remote; check your network and git credentials.",

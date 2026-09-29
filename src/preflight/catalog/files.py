@@ -3,6 +3,8 @@ git status only; never the contents."""
 
 from __future__ import annotations
 
+import shlex
+
 from pydantic import Field
 
 from preflight.check import Section, check
@@ -36,7 +38,9 @@ def _ignored(ctx, path: str) -> Item:
     if result.rc == 0:
         return ok(path)
     if result.rc == 1:
-        return fail(path, do=f"Add {path} to .gitignore.", paste=f"echo '{path}' >> .gitignore")
+        return fail(
+            path, do=f"Add {path} to .gitignore.", paste=f"echo {shlex.quote(path)} >> .gitignore"
+        )
     return error(path, do="git could not check .gitignore here.", error_type="GitError")
 
 
@@ -54,7 +58,10 @@ def _committed(ctx, path: str) -> Item:
     return fail(
         path,
         do=f"Commit {path}.",
-        paste=f"git add {path} && git commit -m 'chore: commit {path}'",
+        paste=(
+            f"git add -- {shlex.quote(path)} && "
+            f"git commit -m {shlex.quote(f'chore: commit {path}')}"
+        ),
         generic=True,
     )
 

@@ -1,3 +1,5 @@
+import shlex
+
 from fakes import FakeHost, FakeResult, make_ctx
 
 from preflight.catalog import files, git, sops
@@ -26,6 +28,28 @@ def test_up_to_date(tmp_path):
     assert run(git.up_to_date, section, tmp_path, unfetched).status is Status.FAIL
     offline = FakeHost([("ls-remote", FakeResult(128))])
     assert run(git.up_to_date, section, tmp_path, offline).items[0].error_type == "GitRemote"
+    assert "GIT_TERMINAL_PROMPT=0" in offline.commands[0]
+    assert not any("fetch" in c for c in ok_host.commands + behind.commands + offline.commands)
+
+
+def test_up_to_date_missing_branch_and_quoted_paste(tmp_path):
+    empty = FakeHost([("ls-remote", FakeResult(0, ""))])
+    item = run(git.up_to_date, git.UpToDateSection(), tmp_path, empty).items[0]
+    assert item.status is Status.FAIL
+    assert "does not exist on origin" in item.next_step.do
+    odd = git.UpToDateSection(remote="my remote", branch="feat/it's")
+    remote = ("ls-remote", FakeResult(0, f"{SHA}\trefs/heads/x\n"))
+    behind = FakeHost([remote, ("cat-file", FakeResult(0)), ("merge-base", FakeResult(1))])
+    paste = run(git.up_to_date, odd, tmp_path, behind).items[0].next_step.paste
+    assert shlex.split(paste) == [
+        "git",
+        "fetch",
+        "my remote",
+        "&&",
+        "git",
+        "rebase",
+        "my remote/feat/it's",
+    ]
 
 
 def test_files_present_and_absent(tmp_path):
@@ -41,7 +65,23 @@ def test_files_git_ignored_and_committed(tmp_path):
     section = files.FilesSection(paths=["secrets/prod.sops.yaml"])
     ignored = FakeHost([("check-ignore", FakeResult(1))])
     item = run(files.git_ignored, section, tmp_path, ignored).items[0]
-    assert item.next_step.paste == "echo 'secrets/prod.sops.yaml' >> .gitignore"
+    assert item.next_step.paste == "echo secrets/prod.sops.yaml >> .gitignore"
+    odd = files.FilesSection(paths=["my dir/it's.yaml"])
+    host = FakeHost([("check-ignore", FakeResult(1)), ("ls-files", FakeResult(1))])
+    paste = run(files.git_ignored, odd, tmp_path, host).items[0].next_step.paste
+    assert shlex.split(paste) == ["echo", "my dir/it's.yaml", ">>", ".gitignore"]
+    paste = run(files.committed, odd, tmp_path, host).items[0].next_step.paste
+    assert shlex.split(paste) == [
+        "git",
+        "add",
+        "--",
+        "my dir/it's.yaml",
+        "&&",
+        "git",
+        "commit",
+        "-m",
+        "chore: commit my dir/it's.yaml",
+    ]
     committed = FakeHost([("ls-files", FakeResult(0)), ("diff --quiet", FakeResult(1))])
     assert run(files.committed, section, tmp_path, committed).status is Status.FAIL
 
@@ -69,3 +109,15 @@ def test_sops_rule(tmp_path):
     assert (missing.status, missing.next_step.generic) == (Status.FAIL, True)
     broken = FakeHost(files={f"{tmp_path}/.sops.yaml": "creation_rules:\n  - path_regex: '('\n"})
     assert run(sops.rule, section, tmp_path, broken).items[0].error_type == "RegexError"
+
+
+def test_sops_rule_malformed_config(tmp_path):
+    section = sops.SopsRuleSection(paths=["secrets/a.yaml"])
+    for body in ("- a\n- b\n", "just a string\n", "creation_rules:\n  a: b\n"):
+        host = FakeHost(files={f"{tmp_path}/.sops.yaml": body})
+        item = run(sops.rule, section, tmp_path, host).items[0]
+        assert (item.status, item.error_type) == (Status.ERROR, "YAMLError")
+    empty = FakeHost(files={f"{tmp_path}/.sops.yaml": "creation_rules:\n"})
+    item = run(sops.rule, section, tmp_path, empty).items[0]
+    assert item.status is Status.FAIL
+    assert "creation rule" in item.next_step.do
