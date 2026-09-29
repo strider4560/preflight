@@ -74,10 +74,15 @@ ref = "README, DNS step 1"
   which is read when the check runs. References resolve from the repository root.
 - `placeholder` lists values meaning "not filled in yet"; a placeholder becomes a failing step
   ("fill `account_id` in `envs/dev.tfvars`") that blocks everything using it. `how` says where
-  the value comes from.
-- `[<section>.remedy]` (`do`, `paste`, `wait`, `ref`, with `{environment}` and the section's
-  scalar fields) adds repository-specific guidance to a generic check.
+  the value comes from. Placeholders are not supported on `ssm` references; a missing or empty
+  parameter is already reported by `ssm.present`.
+- `[<section>.remedy]` (`do`, `paste`, `wait`, `ref`) adds repository-specific guidance to a
+  generic check. Its templates can use `{environment}` and the section's plain scalar fields,
+  but not a field that is a placeholder or an `ssm` value.
 - Every section accepts `region` and `timeout`.
+- Every `ssm` value brings in an `ssm.present[<name>]` step, keyed by the parameter name alone.
+  In v1, a parameter read through two identities is therefore checked once, as the first
+  identity that reads it.
 
 ### Gates
 
@@ -114,10 +119,12 @@ def route(ctx, s):
 ```
 
 A check observes through `ctx.host` (testinfra: `run`, `file`), `ctx.ansible_host` and
-`ctx.aws_module(...)` (Ansible modules with the identity's profile and region),
-`ctx.ssm_lookup(name)`, and `ctx.dns`. It returns an `Outcome` of items: `ok`, `fail`
-(the operator has something to do), `pending` (done, settling), `error` (could not observe).
-Items may be `advisory`. Never put secret values in an item.
+`ctx.aws_module(module, args, expect=("certificates",))` (Ansible modules with the identity's
+profile and region), `ctx.ssm_lookup(name)`, and `ctx.dns`. `expect` is required: it names the
+keys a successful result carries, and a result without them raises `ModuleFailed` rather than
+being read as a value. A check returns an `Outcome` of items: `ok`, `fail` (the operator has
+something to do), `pending` (done, settling), `error` (could not observe). Items may be
+`advisory`. Never put secret values in an item.
 
 ## Catalog
 
@@ -141,17 +148,19 @@ Items may be `advisory`. Never put secret values in an item.
 | Command | Exit |
 |---|---|
 | `preflight check <gate.py> --contract <file> [--json F] [--junit F] [--jobs N]` | 0 every blocking item ok; 1 not; 2 invalid contract or gate (nothing observed); 3 preflight bug; 130 interrupted |
-| `preflight status [--gates D] [--contracts D] [--json F] [--jobs N]` | 0 only when every milestone gate is satisfied everywhere; 2 for a consumer whose environment gates have no environment contract |
+| `preflight status [--gates D] [--contracts D] [--json F] [--jobs N]` | 0 only when every milestone gate is satisfied everywhere; 1 otherwise; 2 invalid; 3 preflight bug |
 | `preflight validate [--gates D] [--contracts D]` | 0 or 2 (also 2 for a consumer whose environment gates have no environment contract); needs no credentials; add it to CI |
 
 An internal error (exit 3) prints only the exception type.
 
 Each instance runs in its own worker process with a cleaned environment: stray AWS credential
-variables and `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_VAR_*` are removed, as are AWS endpoint-override and
-container-credential variables (except for `aws.assumed`, which observes the caller's own
-shell), and the identity's profile and region are set. Workers run Python in safe-path mode,
-so files in the consumer's repository cannot shadow preflight's imports. Timeouts kill the worker's whole process group. JSON reports are
-written with mode 0600; JUnit never marks anything skipped.
+variables and `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_VAR_*` are removed, as are AWS
+endpoint-override and container-credential variables (except for `aws.assumed`, which observes
+the caller's own shell), and the identity's profile and region are set. Workers run Python in
+safe-path mode, so files in the consumer's repository cannot shadow preflight's imports, and
+no bytecode is written into the consumer's repository. Timeouts kill the worker's whole process
+group. JSON and JUnit reports are written atomically with mode 0600, into a directory that must
+already exist; JUnit never marks anything skipped.
 
 ## Developing preflight
 
