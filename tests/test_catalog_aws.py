@@ -15,6 +15,37 @@ def caller(account="111111111111", arn=ROLE_ARN):
     return FakeAnsibleHost({"amazon.aws.aws_caller_info": {"account": account, "arn": arn}})
 
 
+def listing(stdout="", rc=0):
+    return FakeHost([("aws configure list-profiles", FakeResult(rc, stdout))])
+
+
+def failing_session(tmp_path, host):
+    failure = AnsibleException({"failed": True, "msg": "no such profile"})
+    ansible = FakeAnsibleHost({"amazon.aws.aws_caller_info": failure})
+    return aws.session.observe(make_ctx(tmp_path, host=host, ansible=ansible), SECTION).items[0]
+
+
+def test_session_missing_profile_gets_the_setup_step(tmp_path):
+    item = failing_session(tmp_path, listing("other\n  default \n"))
+    assert item.status is Status.ERROR
+    assert item.error_type == "MissingProfile"
+    assert item.next_step.do == "Profile sandbox is not configured; add it to ~/.aws/config."
+    assert item.next_step.paste == "aws configure sso --profile sandbox"
+
+
+def test_session_listed_profile_gets_the_sign_in_step(tmp_path):
+    item = failing_session(tmp_path, listing("other\n  sandbox \n"))
+    assert item.error_type == "AnsibleException"
+    assert item.next_step.do == "Sign in to profile sandbox."
+    assert item.next_step.paste == "aws sso login --profile sandbox"
+
+
+def test_session_unlistable_profiles_keep_the_sign_in_step(tmp_path):
+    item = failing_session(tmp_path, listing("", rc=127))
+    assert item.error_type == "AnsibleException"
+    assert item.next_step.paste == "aws sso login --profile sandbox"
+
+
 def test_session_ok_observes_with_the_named_profile(tmp_path):
     ansible = caller()
     result = aws.session.observe(make_ctx(tmp_path, ansible=ansible), SECTION)
@@ -34,7 +65,11 @@ def test_session_mismatch_names_the_expected_role(tmp_path):
 
 def test_session_error_keeps_the_module_message_out(tmp_path):
     failure = AnsibleException({"failed": True, "msg": "token expired SECRET"})
-    ctx = make_ctx(tmp_path, ansible=FakeAnsibleHost({"amazon.aws.aws_caller_info": failure}))
+    ctx = make_ctx(
+        tmp_path,
+        host=listing("sandbox\n"),
+        ansible=FakeAnsibleHost({"amazon.aws.aws_caller_info": failure}),
+    )
     item = aws.session.observe(ctx, SECTION).items[0]
     assert item.status is Status.ERROR
     assert item.error_type == "AnsibleException"
@@ -44,7 +79,11 @@ def test_session_error_keeps_the_module_message_out(tmp_path):
 
 def test_session_non_raising_module_failure_is_an_error(tmp_path):
     failed = {"changed": False, "msg": "Couldn't connect to AWS: SECRET"}
-    ctx = make_ctx(tmp_path, ansible=FakeAnsibleHost({"amazon.aws.aws_caller_info": failed}))
+    ctx = make_ctx(
+        tmp_path,
+        host=listing("sandbox\n"),
+        ansible=FakeAnsibleHost({"amazon.aws.aws_caller_info": failed}),
+    )
     item = aws.session.observe(ctx, SECTION).items[0]
     assert item.status is Status.ERROR
     assert item.error_type == "ModuleFailed"

@@ -3,6 +3,8 @@ command act as it (`aws.assumed`), and is the profile's region the expected one 
 
 from __future__ import annotations
 
+import shlex
+
 from preflight.check import IdentitySection, check, session_for
 from preflight.outcome import Outcome, error, fail, ok, outcome
 
@@ -34,16 +36,33 @@ def _caller(ctx, *, ambient: bool) -> tuple[str, str]:
     return str(info.get("account", "")), str(info.get("arn", ""))
 
 
+def _profile_missing(ctx, profile: str) -> bool:
+    """True only when the CLI lists profiles and this one is not among them."""
+    listing = ctx.host.run("aws configure list-profiles")
+    if listing.rc != 0:
+        return False
+    return profile not in [line.strip() for line in listing.stdout.splitlines()]
+
+
 @check("aws.session", binds="identity")
 def session(ctx, s: IdentitySection) -> Outcome:
     identity = ctx.identity
-    login = f"aws sso login --profile {identity.profile}"
+    profile = identity.profile
+    login = f"aws sso login --profile {shlex.quote(profile)}"
     try:
         account, arn = _caller(ctx, ambient=False)
     except Exception as exc:
+        if _profile_missing(ctx, profile):
+            return outcome(
+                error(
+                    do=f"Profile {profile} is not configured; add it to ~/.aws/config.",
+                    paste=f"aws configure sso --profile {shlex.quote(profile)}",
+                    error_type="MissingProfile",
+                )
+            )
         return outcome(
             error(
-                do=f"Sign in to profile {identity.profile}.",
+                do=f"Sign in to profile {profile}.",
                 paste=login,
                 error_type=type(exc).__name__,
             )

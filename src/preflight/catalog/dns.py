@@ -18,7 +18,7 @@ Domain = Annotated[
 Label = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")]
 NEGATIVE_CACHE = (
     "resolvers may keep the old answer for up to the zone's negative-cache TTL "
-    "(its SOA minimum) after a fix"
+    "(the lower of its SOA record's TTL and SOA minimum) after a fix"
 )
 
 
