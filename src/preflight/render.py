@@ -218,19 +218,23 @@ def report_json(
     }
 
 
-def write_json(path: Path, data: Any) -> None:
+def write_text(path: Path, text: str) -> None:
+    """Replaces `path` atomically with `text` (UTF-8), readable by the owner only."""
     path = Path(path)
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(data, handle, indent=2, default=str)
-            handle.write("\n")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, path)
     except BaseException:
         Path(name).unlink(missing_ok=True)
         raise
+
+
+def write_json(path: Path, data: Any) -> None:
+    write_text(path, json.dumps(data, indent=2, default=str) + "\n")
 
 
 def to_junit(name: str, results: Mapping[str, NodeResult]) -> str:

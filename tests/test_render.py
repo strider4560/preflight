@@ -13,6 +13,7 @@ from preflight.render import (
     report_json,
     to_junit,
     write_json,
+    write_text,
 )
 from preflight.runner import NodeResult
 
@@ -196,3 +197,13 @@ def test_a_failure_without_a_next_step_is_still_open():
     steps = open_steps(results)
     assert [s.item_id for s in steps] == ["k[x]:k"]
     assert "No next step was recorded" in render_check("t", results, color=False)
+
+
+def test_write_text_is_atomic_private_and_utf8(tmp_path):
+    path = tmp_path / "r.xml"
+    path.write_text("old")
+    path.chmod(0o644)
+    write_text(path, "→ é\n")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_bytes() == "→ é\n".encode()
+    assert [p.name for p in tmp_path.iterdir()] == ["r.xml"]

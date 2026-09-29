@@ -24,6 +24,7 @@ from preflight.render import (
     run_json,
     to_junit,
     write_json,
+    write_text,
 )
 from preflight.runner import run_plan
 
@@ -88,6 +89,16 @@ def _with_requirements(gates: list[Gate], chosen: list[Gate]) -> list[Gate]:
     return [gate for gate in gates if gate.name in names]
 
 
+def _report_paths_exist(*paths: Path | None) -> None:
+    problems = [
+        f"{path.parent} does not exist"
+        for path in paths
+        if path is not None and not path.parent.is_dir()
+    ]
+    if problems:
+        raise Invalid(problems)
+
+
 def _defaults(args: argparse.Namespace) -> tuple[Path, Path]:
     if args.gates and args.contracts:
         return Path(args.gates), Path(args.contracts)
@@ -136,6 +147,9 @@ def _validate_all(
     for contract in ([repository] if repository else []) + environments:
         scoped = [g for g in gates if g.scope == contract.scope]
         if not scoped:
+            problems.extend(
+                f"[{name}] in {contract.path.name} is used by no gate" for name in contract.sections
+            )
             continue
         contracts = {contract.scope: contract}
         if repository is not None:
@@ -151,6 +165,7 @@ def _validate_all(
 def cmd_check(args: argparse.Namespace) -> int:
     started = _now()
     try:
+        _report_paths_exist(args.json, args.junit)
         contract = load_contract(args.contract)
         target = load_gate_file(args.gate)
         gates = load_closure(args.gate)
@@ -198,7 +213,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             ),
         )
     if args.junit:
-        Path(args.junit).write_text(to_junit(title, results))
+        write_text(args.junit, to_junit(title, results))
     return exit_code
 
 
@@ -218,6 +233,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     started = _now()
     try:
+        _report_paths_exist(args.json)
         gates_dir, contracts_dir = _defaults(args)
         all_gates = load_directory(gates_dir)
         repository, environments = _load_contracts(contracts_dir)
@@ -234,6 +250,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 if repository is not None:
                     contracts["repository"] = repository
                 runs.append((contract.environment or "", environment_gates, contracts))
+        if not runs:
+            raise Invalid(["no milestone gates to check (every gate has guards=)"])
         plans = [
             (label, gates, build_plan(gates, contracts, link_gates=False, strict=False))
             for label, gates, contracts in runs
@@ -338,15 +356,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    # Gate and check files are imported from the consumer's repository; leave no bytecode there.
+    writes_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
-        return args.handler(args)
-    except KeyboardInterrupt:
-        print("preflight: interrupted", file=sys.stderr)
-        return 130
-    except Exception as exc:  # a bug in preflight itself
-        print(f"preflight: internal error ({type(exc).__name__})", file=sys.stderr)
-        return 3
+        args = build_parser().parse_args(argv)
+        try:
+            return args.handler(args)
+        except KeyboardInterrupt:
+            print("preflight: interrupted", file=sys.stderr)
+            return 130
+        except Exception as exc:  # a bug in preflight itself
+            print(f"preflight: internal error ({type(exc).__name__})", file=sys.stderr)
+            return 3
+    finally:
+        sys.dont_write_bytecode = writes_bytecode
 
 
 if __name__ == "__main__":

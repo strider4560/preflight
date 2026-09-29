@@ -153,3 +153,20 @@ def test_status_json_lists_every_run_and_every_open_item(repo, monkeypatch, tmp_
     ]
     assert report["open"] == ["dev: sample.flag[boot]", "dev: sample.flag[later_flag]"]
     assert report["next"] == "dev: sample.flag[boot]"
+
+
+def test_status_with_no_milestone_gates_is_exit_2(repo, monkeypatch, capsys):
+    write(repo, "preflight/checks/flags.py", CHECKS)
+    write(
+        repo, "preflight/contracts/dev.toml", ENV_TOML.format(env="dev", boot="true", later="true")
+    )
+    write(
+        repo,
+        "preflight/gates/bootstrap_entry.py",
+        "from preflight import Gate\nfrom consumer.checks.flags import flag\n\n"
+        'gate = Gate("bootstrap_entry", checks=[flag("entry"), flag("boot"), flag("later_flag")], '
+        'guards="scripts/bootstrap.sh")\n',
+    )
+    monkeypatch.chdir(repo)
+    assert cli.main(["status"]) == 2
+    assert "no milestone gates to check (every gate has guards=)" in capsys.readouterr().err

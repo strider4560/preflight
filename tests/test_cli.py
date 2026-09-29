@@ -1,5 +1,6 @@
 import json
 import stat
+import sys
 
 import pytest
 from conftest import write
@@ -227,3 +228,74 @@ def test_a_missing_contract_is_exit_2(repo, capsys):
     gate_path, _ = consumer(repo)
     missing = repo / "preflight" / "contracts" / "nope.toml"
     assert cli.main(["check", str(gate_path), "--contract", str(missing)]) == 2
+
+
+def test_check_leaves_no_bytecode_in_the_consumer(repo, monkeypatch):
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    gate_path, contract = consumer(repo)
+    assert cli.main(["check", str(gate_path), "--contract", str(contract)]) == 0
+    assert list((repo / "preflight").rglob("__pycache__")) == []
+
+
+@pytest.mark.parametrize("flag", ["--json", "--junit"])
+def test_a_report_in_a_missing_directory_is_exit_2(repo, monkeypatch, capsys, flag):
+    gate_path, contract = consumer(repo)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("observed")
+
+    monkeypatch.setattr(cli, "run_plan", boom)
+    target = repo / "missing" / "r.out"
+    args = ["check", str(gate_path), "--contract", str(contract), flag, str(target)]
+    assert cli.main(args) == 2
+    assert f"{repo / 'missing'} does not exist" in capsys.readouterr().err
+
+
+def test_status_report_in_a_missing_directory_is_exit_2(repo, monkeypatch, capsys):
+    consumer(repo)
+    monkeypatch.chdir(repo)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("observed")
+
+    monkeypatch.setattr(cli, "run_plan", boom)
+    assert cli.main(["status", "--json", "missing/status.json"]) == 2
+    assert "missing does not exist" in capsys.readouterr().err
+
+
+def test_junit_reports_are_private(repo, tmp_path_factory):
+    gate_path, contract = consumer(repo, good="false")
+    out = tmp_path_factory.mktemp("out")
+    args = ["check", str(gate_path), "--contract", str(contract), "--junit", str(out / "r.xml")]
+    assert cli.main(args) == 1
+    assert stat.S_IMODE((out / "r.xml").stat().st_mode) == 0o600
+    assert [p.name for p in out.iterdir()] == ["r.xml"]
+
+
+def test_validate_reports_a_repository_contract_no_gate_uses(repo, monkeypatch, capsys):
+    consumer(repo)
+    write(
+        repo,
+        "preflight/contracts/repo.toml",
+        'schema_version = 1\nscope = "repository"\n\n[x]\ngood = true\n',
+    )
+    monkeypatch.chdir(repo)
+    assert cli.main(["validate"]) == 2
+    assert "[x] in repo.toml is used by no gate" in capsys.readouterr().err
+
+
+def test_validate_reports_an_environment_contract_no_gate_uses(repo, monkeypatch, capsys):
+    consumer(repo)
+    for name in ("g", "touch"):
+        (repo / "preflight" / "gates" / f"{name}.py").unlink()
+    gate(repo, "repo_gate", 'flag("x")', scope="repository")
+    write(
+        repo,
+        "preflight/contracts/repo.toml",
+        'schema_version = 1\nscope = "repository"\n\n[x]\ngood = true\n',
+    )
+    monkeypatch.chdir(repo)
+    assert cli.main(["validate"]) == 2
+    err = capsys.readouterr().err
+    assert "[flags] in dev.toml is used by no gate" in err
+    assert "[touch] in dev.toml is used by no gate" in err
