@@ -14,6 +14,17 @@ CREDENTIAL_VARIABLES = (
     "AWS_SESSION_TOKEN",
     "AWS_SECURITY_TOKEN",
 )
+# Other variables that make the CLI or SDK ignore the selected profile.
+PROFILE_OVERRIDES = (
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_ENDPOINT_URL",
+)
 
 
 def _caller(ctx, *, ambient: bool) -> tuple[str, str]:
@@ -56,7 +67,8 @@ def session(ctx, s: IdentitySection) -> Outcome:
 
 def _environment_fix(environ, identity) -> str:
     lines = []
-    stray = [name for name in CREDENTIAL_VARIABLES if name in environ]
+    stray = [name for name in CREDENTIAL_VARIABLES + PROFILE_OVERRIDES if name in environ]
+    stray += sorted(name for name in environ if name.startswith("AWS_ENDPOINT_URL_"))
     if stray:
         lines.append("unset " + " ".join(stray))
     if environ.get("AWS_PROFILE") != identity.profile:
@@ -85,13 +97,25 @@ def assumed(ctx, s: IdentitySection) -> Outcome:
     observed = {"account": account, "arn": arn}
     if identity.matches(account, arn):
         return outcome(ok(observed=observed))
+    if not fix:
+        return outcome(
+            fail(
+                do=(
+                    f"Your shell uses profile {identity.profile}, which signs in as {arn} in "
+                    f"account {account}; the next command needs {identity.describe()}. "
+                    f"Check profile {identity.profile} in ~/.aws/config, then sign in again."
+                ),
+                paste=login,
+                observed=observed,
+            )
+        )
     return outcome(
         fail(
             do=(
                 f"Your shell acts as {arn} in account {account}; the next command needs "
                 f"{identity.describe()}."
             ),
-            paste=fix or f"export AWS_PROFILE={identity.profile}",
+            paste=fix,
             observed=observed,
         )
     )
@@ -103,6 +127,14 @@ def region(ctx, s: IdentitySection) -> Outcome:
     result = ctx.host.run("aws configure get region --profile %s", identity.profile)
     if result.rc == 127:
         return outcome(error(do="Install the AWS CLI.", error_type="MissingTool"))
+    if result.rc not in (0, 1):
+        return outcome(
+            error(
+                do=f"Profile {identity.profile} is not configured; add it to ~/.aws/config.",
+                paste=f"aws configure sso --profile {identity.profile}",
+                error_type="AwsCli",
+            )
+        )
     configured = result.stdout.strip()
     if result.rc == 0 and configured == identity.region:
         return outcome(ok(observed=configured))

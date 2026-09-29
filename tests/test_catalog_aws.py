@@ -101,3 +101,36 @@ def test_region(tmp_path):
     assert item.next_step.paste == "aws configure set region us-east-1 --profile sandbox"
     item = aws.region.observe(make_ctx(tmp_path, host=missing), SECTION).items[0]
     assert (item.status, item.error_type) == (Status.ERROR, "MissingTool")
+
+
+def test_assumed_unsets_variables_that_override_the_profile(tmp_path):
+    environ = {
+        "AWS_ROLE_ARN": "r",
+        "AWS_ENDPOINT_URL_STS": "http://x",
+        "AWS_ENDPOINT_URL_S3": "http://y",
+        "AWS_PROFILE": "sandbox",
+    }
+    ctx = make_ctx(tmp_path, ansible=caller("222222222222", OTHER_ARN), environ=environ)
+    item = aws.assumed.observe(ctx, SECTION).items[0]
+    assert item.next_step.paste == "unset AWS_ROLE_ARN AWS_ENDPOINT_URL_S3 AWS_ENDPOINT_URL_STS"
+
+
+def test_assumed_mismatch_with_nothing_to_change_blames_the_profile(tmp_path):
+    ctx = make_ctx(
+        tmp_path, ansible=caller("222222222222", OTHER_ARN), environ={"AWS_PROFILE": "sandbox"}
+    )
+    item = aws.assumed.observe(ctx, SECTION).items[0]
+    assert item.status is Status.FAIL
+    assert item.next_step.paste == "aws sso login --profile sandbox"
+    assert "~/.aws/config" in item.next_step.do
+
+
+def test_region_other_rc_is_an_error_and_other_region_fails(tmp_path):
+    broken = FakeHost([("aws configure get region", FakeResult(255, ""))])
+    item = aws.region.observe(make_ctx(tmp_path, host=broken), SECTION).items[0]
+    assert (item.status, item.error_type) == (Status.ERROR, "AwsCli")
+    assert item.next_step.paste == "aws configure sso --profile sandbox"
+    other = FakeHost([("aws configure get region", FakeResult(0, "eu-west-1\n"))])
+    item = aws.region.observe(make_ctx(tmp_path, host=other), SECTION).items[0]
+    assert item.status is Status.FAIL
+    assert item.next_step.paste == "aws configure set region us-east-1 --profile sandbox"
