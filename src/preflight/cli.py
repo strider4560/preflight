@@ -128,6 +128,11 @@ def _validate_all(
             f"gate(s) {', '.join(repository_gates)} have repository scope; "
             'add a contract with scope = "repository"'
         )
+    environment_gates = [g.name for g in gates if g.scope == "environment"]
+    if environment_gates and not environments:
+        problems.append(
+            f"environment gate(s) {', '.join(environment_gates)} have no environment contract"
+        )
     for contract in ([repository] if repository else []) + environments:
         scoped = [g for g in gates if g.scope == contract.scope]
         if not scoped:
