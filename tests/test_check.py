@@ -66,5 +66,12 @@ def test_field_problems_leaves_skipped_fields_alone():
     assert field_problems(Things, {"zones": "lazy", "root": "x"}, {"zones"}) == []
 
 
+def test_a_bad_section_region_is_a_field_problem():
+    from preflight.check import Section
+
+    problems = field_problems(Section, {"region": "not a region"}, set())
+    assert any(p.startswith("region") for p in problems)
+
+
 def test_unknown_keys_are_ignored_by_one_model():
     assert field_problems(Things, {"zones": [], "root": "x", "other": 1}, set()) == []

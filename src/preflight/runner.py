@@ -14,8 +14,8 @@ from pathlib import Path
 from preflight.check import REGISTRY
 from preflight.graph import Node, Plan
 from preflight.identity import Identity, worker_environment
-from preflight.outcome import Outcome, Status, apply_remedy
-from preflight.worker import Job, encode_data, kill_all, launch
+from preflight.outcome import Outcome, Status, apply_remedy, error, outcome
+from preflight.worker import Job, encode_data, kill_all, launch, reset_stop
 
 
 @dataclass
@@ -63,14 +63,21 @@ def job_for(node: Node) -> Job:
 
 
 def default_launcher(node: Node) -> Outcome:
-    check = REGISTRY[node.check_id]
-    env = worker_environment(
-        os.environ,
-        _identity(node),
-        keep_aws=check.ambient,
-        bin_dir=str(Path(sys.executable).parent),
-    )
-    return launch(job_for(node), env=env, timeout=node.timeout)
+    try:
+        check = REGISTRY[node.check_id]
+        env = worker_environment(
+            os.environ,
+            _identity(node),
+            keep_aws=check.ambient,
+            bin_dir=str(Path(sys.executable).parent),
+        )
+        job = job_for(node)
+    except Exception as exc:
+        name = type(exc).__name__
+        return outcome(
+            error(do=f"Preflight could not prepare {node.check_id} ({name}).", error_type=name)
+        )
+    return launch(job, env=env, timeout=node.timeout)
 
 
 def _timed(launcher: Launcher, node: Node) -> tuple[Outcome, float]:
@@ -87,6 +94,7 @@ def _finish(node: Node, result: Outcome, duration: float) -> NodeResult:
 def run_plan(
     plan: Plan, *, jobs: int = 4, launcher: Launcher = default_launcher
 ) -> dict[str, NodeResult]:
+    reset_stop()
     order = plan.ordered()
     results: dict[str, NodeResult] = {}
     waiting = list(order)
@@ -118,7 +126,8 @@ def run_plan(
                         results[node.id] = _finish(node, result, duration)
                 elif not progressed:
                     raise RuntimeError("some instances wait on prerequisites that never finish")
-        except KeyboardInterrupt:
+        except BaseException:
             kill_all()
+            pool.shutdown(wait=False, cancel_futures=True)
             raise
     return {node.id: results[node.id] for node in order}

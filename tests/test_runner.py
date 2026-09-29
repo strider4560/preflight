@@ -117,3 +117,31 @@ def test_an_interrupt_kills_the_workers(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         runner.run_plan(plan(node("a")), launcher=launch)
     assert killed == [True]
+
+
+def test_any_launcher_exception_kills_the_workers(monkeypatch):
+    killed = []
+    monkeypatch.setattr(runner, "kill_all", lambda: killed.append(True))
+
+    def launch(n):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        runner.run_plan(plan(node("a")), launcher=launch)
+    assert killed == [True]
+
+
+def test_run_plan_resets_the_stop_flag_first(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "reset_stop", lambda: calls.append(True))
+    runner.run_plan(plan(node("a")), launcher=scripted({"a": outcome(ok())}))
+    assert calls == [True]
+
+
+def test_a_job_that_cannot_be_built_is_an_error_outcome():
+    identity = {"profile": "p", "region": "us-east-1", "account_id": "<FILL>", "role": "r"}
+    c = contract()
+    c.identity_data = {"admin": identity}
+    n = node("a", c=c)
+    n.identity = "admin"
+    assert runner.default_launcher(n).status is Status.ERROR

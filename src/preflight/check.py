@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, ValidationError
 
+from preflight.identity import Region
 from preflight.outcome import Outcome
 
 Name = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$")]
@@ -30,7 +31,7 @@ class Section(BaseModel):
 
     model_config = ConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
 
-    region: str | None = None
+    region: Region | None = None
     timeout: float | None = Field(default=None, gt=0)
     remedy: Remedy = Remedy()
 
