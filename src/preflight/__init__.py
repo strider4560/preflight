@@ -11,6 +11,7 @@ from preflight.check import (
     check,
     session_for,
 )
+from preflight.gate import Gate
 from preflight.outcome import (
     Item,
     NextStep,
@@ -28,6 +29,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Check",
     "CheckInstance",
+    "Gate",
     "IdentityRef",
     "IdentitySection",
     "Item",
