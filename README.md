@@ -1,283 +1,164 @@
-# IaC preflight
+# preflight
 
-Drop this entire `preflight/` directory into your IaC repository. It is an independent
-`uv` project: Python 3.12+, pytest, pytest-testinfra, boto3, and typed TOML contracts.
-
-The runner executes every check in the contract's selected modules, writes reports,
-and optionally starts another command **only when every selected check passes**.
-The included checks observe existing infrastructure; they do not repair it.
-
-## Start here
-
-Run these commands from your IaC repository root:
+Guardrails for the steps only the operator can do. A script calls preflight first and stops
+unless it exits 0; when something is not done, preflight names the next step, with text to paste.
 
 ```bash
-uv sync --project preflight --locked
-cp preflight/contracts/prod.example.toml preflight/contracts/prod.local.toml
+# top of scripts/bootstrap.sh in a consumer repository
+preflight() { uvx --from "git+https://github.com/strider4560/preflight@v0.1.0" preflight "$@"; }
+preflight check preflight/gates/bootstrap_entry.py --contract "preflight/contracts/$env.toml" || exit 1
 ```
 
-Edit `prod.local.toml`: replace all example account IDs, role ARNs, resource IDs,
-profiles, capacity budgets and state settings, then set `example = false`.
-The unedited example is deliberately rejected before any AWS calls.
+Preflight never runs the command it gates and never changes what it observes. It checks what
+the operator is responsible for (DNS records in another account, secrets, IAM and GitHub
+settings, sessions) and leaves what OpenTofu and the pipeline prove to them.
+
+## Requirements
+
+Python 3.12 or newer, provided by `uv` / `uvx`. Checks shell out to these tools, and each is
+needed only by the checks that use it:
+
+- `aws` CLI: `aws.region`
+- `tofu`: `tofu.plan_clean`
+- `gh` 2.48 or newer: `github.*` (list endpoints use `gh api --paginate --slurp`)
+- `git`: `git.*` and `files.git_ignored` / `files.committed`; contracts must live in a git work tree
+
+## Where was I?
 
 ```bash
-# Run the required checks and write reports.
-uv run --project preflight --locked python preflight/run.py \
-  --contract preflight/contracts/prod.local.toml
-
-# Gate an existing operational script. Its working directory remains the repo root.
-uv run --project preflight --locked python preflight/run.py \
-  --contract preflight/contracts/prod.local.toml \
-  -- ./scripts/deploy.sh
-
-# Or gate the included init-and-plan example; this does not apply the plan.
-uv run --project preflight --locked python preflight/run.py \
-  --contract preflight/contracts/prod.local.toml \
-  -- bash preflight/examples/terraform-plan.sh -out=tfplan
+uvx --from "git+https://github.com/strider4560/preflight@v0.1.0" preflight status
 ```
 
-An existing Python/uv workspace may need `preflight` excluded from its workspace
-members if you want this to remain an independent project. Keep `uv.lock` committed.
-For CI, use `--locked --no-dev` with both `uv sync` and `uv run`.
+`status` runs every milestone gate against every contract and prints, per environment, which
+gates are satisfied, which are open, and which wait on an earlier gate, then one overall NEXT.
+Steps in gates that are still waiting are listed as "also open", because some expire (an SNS
+confirmation link, a certificate's 72 hours).
 
-## Layout
+## A consumer repository
 
-| Path | Purpose |
-| --- | --- |
-| `run.py` | Public command runner |
-| `gate/cli.py` | Launch pytest, validate completed evidence, then run an optional command |
-| `gate/plugin.py` | Mandatory-check semantics and JSON reporting |
-| `gate/contract.py` | TOML schema, validation, workspace state-key resolution |
-| `gate/aws.py` | Explicit, identity-verified Boto3 sessions and clients |
-| `gate/assertions.py` | Optional expected/observed/remediation failure formatting |
-| `checks/conftest.py` | Shared fixtures and contract-based parametrization |
-| `checks/identity/` | Effective AWS account and role |
-| `checks/state/` | Bucket configuration and exact state-object access |
-| `checks/network/` | Shared subnet identity, AZ placement and IPv4 capacity |
-| `checks/runtime/` | HTTP readiness from existing Testinfra hosts |
-| `contracts/` | Environment-specific expectations; no credentials |
-| `tests/` | Offline tests of the scaffold itself |
-
-## Contracts and credentials
-
-The contract is the expected state. AWS responses are observations. Do not derive the
-expected account, resource ownership, or minimum capacity from those same observations.
-Module names select directories under `checks/`; all selected modules are mandatory.
-Unselected modules are not imported or run. A missing/empty selected module blocks.
-
-Each entry under `[identities.NAME]` declares an expected account and IAM role ARN.
-It can also name a standard AWS profile. Omit `profile` to use Boto3's normal credential
-chain, including CI environment credentials or a workload role. Role assumption, SSO,
-web identity, source profiles and credential refresh are delegated to the AWS SDK.
-No AWS access keys or secret values belong in this contract.
-
-Every `aws.client("NAME", "SERVICE")` validates the effective STS caller before
-creating the service client, even if the `identity` module was not selected.
-This scaffold deliberately accepts assumed roles only, not IAM users or root.
-Role paths are normalized to the role name in the STS assumed-role ARN; account and
-partition must also match. Role recreation is not detected by a pinned IAM role ID.
-
-**Terraform authentication remains independently configured.** The runner does not
-export Boto3 credentials to Terraform or change `AWS_PROFILE`. Make both tools use
-matching profiles and role chains. For example, the example contract corresponds to
-an AWS provider using profile `terraform-prod` and an S3 backend using profile
-`terraform-state`. The default credential chain only works for both when their
-resulting identities agree. Also align provider/backend regions and workspace settings.
-
-When Terraform's provider has an inline `assume_role` configuration, mirror that effective
-role through an AWS profile used by Boto3. Checking only the provider's source credentials
-would test the wrong identity. Avoid a more privileged profile just to make a gate pass.
-
-A separate `state.inspection_identity` can inspect bucket/KMS configuration. Define
-that alias in `[identities]`. The actual state-object check always uses `state.identity`,
-so an inspector's access cannot substitute for backend access.
-
-## What the initial modules establish
-
-### Identity
-
-Verifies the effective account and assumed role. Successful `GetCallerIdentity` does
-not prove any deployment permission. The SDK session is reused within a run; profile
-providers retain their normal credential refresh behavior.
-
-### State
-
-Checks bucket owner (through `ExpectedBucketOwner`), region, versioning, and default
-encryption. If `expected_kms_key_arn` is configured, requires SSE-KMS with that exact
-full key ARN in the bucket defaults and verifies that the key is enabled. Aliases and
-bare key IDs are rejected: an unqualified alias can resolve in a different caller's
-account. If omitted, requires SSE-S3/AES256.
-This is the **bucket default**; align Terraform's own encryption configuration separately.
-
-- `mode = "existing"` reads and discards one byte from the exact state key. It exercises
-  GetObject and, where applicable, KMS decrypt without placing state contents in reports.
-- `mode = "new"` verifies that exact key is absent using a prefix-scoped list. An access
-  error fails the check; it is never interpreted as absence. An existing object fails.
-- The default workspace uses the raw `key`. Other workspaces use
-  `workspace_key_prefix/workspace/key`, normalized like Terraform's Go `path.Join`
-  (including dot segments and repeated slashes); the prefix defaults to `env:`.
-
-These checks **do not certify PutObject, state locking, or every future Terraform
-operation**. They do not write canary objects or touch `.tflock` files. Terraform still
-performs locking. Add a separately designed write probe if your contract requires one.
-After a first deployment, change `mode` to `existing`. Choose the contract appropriate
-to the operation; do not repeatedly run a `new` contract after state has been created.
-
-### Network
-
-Each configured subnet is described through the application identity. Checks validate
-visibility, owner account, VPC, exact AZ ID, available state, disabled automatic public
-IPv4 assignment, and available IPv4 addresses against additional demand plus reserve.
-The manifest requires unique subnet IDs/names and at least `minimum_azs` distinct AZ IDs.
-By matching each observed AZ ID, the suite checks the configured AZ placement as well.
-
-Include rollout surge and replacement overlap in `additional_ipv4_required`. This
-starter takes that budget explicitly; it does not parse Terraform plans. Capacity is
-an observation, not a reservation. It does not inspect route tables, NAT gateways,
-endpoint policies, security groups or NACLs. Add those as separate checks.
-
-### Runtime
-
-Add `runtime` to `modules` and configure `[[runtime.probes]]` entries. Each uses
-Testinfra to run a bounded `curl` request from an existing host/container and compare
-its response body. No probe infrastructure is created automatically.
-
-Supported configured transport prefixes include `local://`, `ssh://`, `docker://`,
-`podman://`, `kubectl://`, `ansible://` and `paramiko://`. Install any transport-specific
-extras and tools you choose; the initial dependency set supports the local and system
-SSH backends. For example, `uv add --project preflight 'pytest-testinfra[paramiko]'`.
-The target needs `curl`. Configure SSH host keys and authentication normally.
-The probe disables per-user curl configuration files so settings such as `insecure`
-cannot silently disable certificate checks. Normal proxy and CA environment settings
-still apply; configure trust on the actual probe host.
-
-A pass proves the route, HTTPS certificate trust when applicable, and service response
-for the actual network location. It does not prove a future workload's IAM permissions or a different security
-group's access. A mandatory probe you cannot run must fail, not skip.
-
-## Inspection permissions
-
-Grant observation permissions deliberately, or use the separate inspection identity.
-Do not expand a deployment role to AdministratorAccess to satisfy metadata checks.
-
-| Checks | Required observation actions |
-| --- | --- |
-| Identity | STS GetCallerIdentity; AWS does not require an Allow for this operation |
-| Bucket configuration | `s3:GetBucketLocation`, `s3:GetBucketVersioning`, `s3:GetEncryptionConfiguration` |
-| KMS configuration, when requested | `kms:DescribeKey` on the configured bucket key |
-| Existing state | `s3:GetObject` on the exact object; applicable `kms:Decrypt` permissions |
-| New state | `s3:ListBucket` with the exact state prefix used by the check |
-| Subnets | `ec2:DescribeSubnets` |
-| Runtime | Existing transport access, target `curl`, and endpoint access |
-
-Bucket policies, key policies, SCPs and endpoint policies can also affect requests.
-An unreadable required observation blocks with an error instead of silently passing.
-
-## Add your first module
-
-Create `checks/platform/test_bootstrap_version.py`:
-
-```python
-import pytest
-from gate.assertions import require
-
-pytestmark = pytest.mark.owner("platform-team")
-
-
-def test_bootstrap_version(aws, contract):
-    settings = contract.settings["platform"]
-    response = aws.client("deploy", "ssm").get_parameter(
-        Name=settings["version_parameter"], WithDecryption=False
-    )
-    version = int(response["Parameter"]["Value"])
-    require(
-        version >= settings["minimum_version"],
-        expected=f"bootstrap version >= {settings['minimum_version']}",
-        observed=version,
-        remediation="Run the platform bootstrap upgrade before this deployment.",
-    )
+```
+preflight/
+  contracts/dev.toml     # expected values for one environment
+  contracts/prod.toml
+  contracts/repo.toml    # optional: scope = "repository", for repository-wide gates
+  gates/<name>.py        # one Gate each, named after its file
+  checks/<name>.py       # checks only this repository needs
 ```
 
-Add `platform` to the contract's `modules` list, then add:
+No Python project is needed: `uvx` provides preflight, and preflight imports the gate and
+check files as the package `consumer` (`from consumer.checks.secrets import route`).
+
+### Contracts
 
 ```toml
-[settings.platform]
-version_parameter = "/platform/bootstrap-version"
-minimum_version = 3
+schema_version = 1
+environment = "dev"
+
+[identities.admin]
+profile        = "sandbox"
+region         = "us-east-1"
+account_id     = { tfvars = "envs/dev.tfvars", key = "account_id", placeholder = ["000000000000"], how = "the Sandbox account ID" }
+permission_set = "AWSAdministratorAccess"
+
+[delegation]
+root         = { tfvars = "envs/dev.tfvars", key = "root_domain" }
+zones        = { tfvars = "envs/dev.tfvars", key = "zones" }
+name_servers = { ssm = "/platform/dns/name_servers", identity = "admin", format = "json", how = "rerun scripts/bootstrap.sh dev from an up-to-date main" }
+
+[delegation.remedy]
+ref = "README, DNS step 1"
 ```
 
-This example assumes a plain String SSM parameter and needs `ssm:GetParameter` access.
-It is a template, not an installed check. Use a module-local `conftest.py` for reusable
-observations, and optionally validate your custom settings with a Pydantic model there.
+- A value is a literal or a reference: `tfvars` (`key`), `yaml` / `json` (`path`),
+  `yaml_glob` (`path`, a list of `{file, value}`), or `ssm` (`identity`, `format`, `path`),
+  which is read when the check runs. References resolve from the repository root.
+- `placeholder` lists values meaning "not filled in yet"; a placeholder becomes a failing step
+  ("fill `account_id` in `envs/dev.tfvars`") that blocks everything using it. `how` says where
+  the value comes from.
+- `[<section>.remedy]` (`do`, `paste`, `wait`, `ref`, with `{environment}` and the section's
+  scalar fields) adds repository-specific guidance to a generic check.
+- Every section accepts `region` and `timeout`.
 
-Ordinary pytest assertions and parametrization work. `contract` and `aws` are shared
-fixtures; Testinfra's `host` fixture is also available, using the local backend by default.
-For remote targets use `testinfra.get_host(...)`, as the runtime module demonstrates.
+### Gates
 
-Keep checks independent. A failed fixture blocks only its dependent tests while other
-checks continue. Reuse observations with appropriately scoped fixtures, and use paginators
-for API listings that can span pages. All tests in a selected module are required: split
-optional diagnostics into a separate contract instead of using skip or xfail markers.
+```python
+from preflight import Gate
+from preflight.catalog import aws, git
 
-## Gate and report behavior
+gate = Gate(
+    "bootstrap_entry",
+    guards="scripts/bootstrap.sh",   # an entry gate: left out of `status`
+    requires=["identifiers"],        # those gates' checks run first, as prerequisites
+    checks=[aws.assumed("admin"), aws.region("admin"), git.up_to_date("branch")],
+)
+```
 
-The wrapper blocks on failed assertions, fixture/collection/teardown errors, skips,
-xfail, xpass, deselection, empty required modules, missing modules, timeout, interrupted
-runs, missing completion reports, and contract changes during execution. It requires
-successful setup, call and teardown for each collected test.
+A check bound to a section is `check("section")`; an AWS identity check is `aws.session("admin")`.
 
-It explicitly loads the required plugins, clears inherited `PYTEST_ADDOPTS` and
-`PYTEST_PLUGINS`, overrides configured `addopts`, and avoids parent-repository conftests.
-If you add a pytest plugin, add it to the explicit list in `gate/cli.py` as well as uv.
-Test modules and repository conftests remain trusted Python code; this is not a sandbox
-against malicious tests or a user bypassing the wrapper.
+### Repository-local checks
 
-Every run gets a unique directory under `preflight/reports/` containing:
+```python
+from preflight import Section, check, fail, ok, outcome, session_for
 
-- `report.html`: self-contained human-readable pytest report.
-- `junit.xml`: CI-compatible test results.
-- `gate.json`: contract hash, selected modules, per-stage results, owners, and blocking reasons.
-- `runner.json`: additional wrapper failure, when applicable, such as a suite timeout.
 
-Invalid contracts are rejected before pytest and report creation. An abrupt termination
-may leave incomplete HTML/XML or no gate.json; the wrapper blocks in that case. Do not
-use the pytest HTML headline alone as the gate decision: pytest can call xfail/skip
-acceptable, while this wrapper deliberately blocks them.
+class Route(Section):
+    identity: str
+    committed: bool
 
-The gate process returns 0 only for a successful gate (and successful child, if any),
-1 for failed/incomplete checks, and 2 for invalid invocation/configuration. After a passing
-gate, a child command's exit status is propagated; failure to start it returns 127.
-Arguments after `--` are passed directly without shell interpretation. The child retains
-the caller's environment and working directory. Compound operations belong in a script.
 
-Default limits are 60 seconds per test and 600 seconds for the suite. Customize with
-`--test-timeout` and `--suite-timeout`. AWS clients use bounded connection/read timeouts
-and retries. On POSIX the total timeout kills the local pytest process group; remote
-commands should retain their own timeouts. Reports are ignored by git and may contain
-sensitive operational details from your assertions/output. Do not print secrets.
+@check("iac.secrets_route", section=Route, requires=[session_for("identity")])
+def route(ctx, s):
+    if s.committed:
+        return outcome(ok())
+    return outcome(fail(do="Commit secrets/dev.sops.yaml.", paste="git add secrets/dev.sops.yaml"))
+```
 
-Re-run volatile checks close to apply, especially after an approval delay. Bootstrap
-checks do not lock shared resources. Retain appropriate Terraform preconditions;
-Terraform `check` blocks alone do not block an operation when an assertion fails.
+A check observes through `ctx.host` (testinfra: `run`, `file`), `ctx.ansible_host` and
+`ctx.aws_module(...)` (Ansible modules with the identity's profile and region),
+`ctx.ssm_lookup(name)`, and `ctx.dns`. It returns an `Outcome` of items: `ok`, `fail`
+(the operator has something to do), `pending` (done, settling), `error` (could not observe).
+Items may be `advisory`. Never put secret values in an item.
 
-## Verify and maintain the scaffold
+## Catalog
 
-These self-tests use local pytest subprocesses, stub AWS responses, and a loopback HTTPS
-server. They do not connect to your AWS accounts, require AWS credentials, or run
-Terraform. The TLS regressions need local `curl` and `openssl`; only those self-tests
-skip if these tools are absent. Operational checks under `checks/` still block on skips.
+| Check | What it proves |
+|---|---|
+| `aws.session[<identity>]` | Preflight can observe as the identity (explicit profile) |
+| `aws.assumed[<identity>]` | The caller's own shell acts as the identity |
+| `aws.region[<identity>]` | The profile's configured region |
+| `ssm.present`, `ssm.parameters` | Parameters exist and are non-empty (read without decryption) |
+| `acm.issued` | Issued; or the exact validation CNAME to add; or waiting |
+| `tofu.plan_clean` | `tofu plan -detailed-exitcode` is 0 (no lock, read-only) |
+| `dns.delegated`, `dns.undelegated` | The parent zone's own servers delegate exactly the expected servers, or nothing. Answers come only from the parent zone's own servers; a lookup nobody answered is an error, never ok |
+| `dns.cname`, `dns.caa` | Records the operator adds by hand |
+| `github.auth`, `repo`, `variables`, `environments`, `ruleset`, `secret_names`, `workflow_green` | GitHub settings; secrets remain name-only |
+| `git.up_to_date` | The checkout contains the remote branch's latest commit (no fetch) |
+| `files.present`, `absent`, `git_ignored`, `committed` | Files and their git status |
+| `sops.rule` | A creation rule with enough age recipients covers each secrets file |
+
+## Commands and exit codes
+
+| Command | Exit |
+|---|---|
+| `preflight check <gate.py> --contract <file> [--json F] [--junit F] [--jobs N]` | 0 every blocking item ok; 1 not; 2 invalid contract or gate (nothing observed); 3 preflight bug; 130 interrupted |
+| `preflight status [--gates D] [--contracts D] [--json F] [--jobs N]` | 0 only when every milestone gate is satisfied everywhere; 2 for a consumer whose environment gates have no environment contract |
+| `preflight validate [--gates D] [--contracts D]` | 0 or 2 (also 2 for a consumer whose environment gates have no environment contract); needs no credentials; add it to CI |
+
+An internal error (exit 3) prints only the exception type.
+
+Each instance runs in its own worker process with a cleaned environment: stray AWS credential
+variables and `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_VAR_*` are removed, as are AWS endpoint-override and
+container-credential variables (except for `aws.assumed`, which observes the caller's own
+shell), and the identity's profile and region are set. Workers run Python in safe-path mode,
+so files in the consumer's repository cannot shadow preflight's imports. Timeouts kill the worker's whole process group. JSON reports are
+written with mode 0600; JUnit never marks anything skipped.
+
+## Developing preflight
 
 ```bash
-uv run --project preflight --locked pytest -c preflight/pyproject.toml preflight/tests
-uv run --project preflight --locked ruff check preflight
-uv run --project preflight --locked ruff format --check preflight
+uv sync
+uv run pytest
+uv run ruff check src tests && uv run ruff format --check src tests
 ```
 
-Update dependencies intentionally with `uv lock --project preflight --upgrade`, then
-run the self-tests and commit the updated lockfile. Keep development self-tests separate
-from `checks/`: a passing harness self-test does not establish AWS readiness.
-
-References: [uv projects](https://docs.astral.sh/uv/guides/projects/),
-[Testinfra](https://testinfra.readthedocs.io/en/latest/),
-[Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3),
-[Boto3 credentials](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html).
+The design is `docs/superpowers/specs/2026-09-29-preflight-library-design.md`.
