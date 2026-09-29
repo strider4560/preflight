@@ -107,9 +107,14 @@ class Contract:
 
 
 def repo_root(start: Path) -> Path:
-    result = subprocess.run(
-        ["git", "-C", str(start), "rev-parse", "--show-toplevel"], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        raise ContractError(start, ["git is not available"]) from None
     if result.returncode != 0:
         raise ContractError(start, ["not inside a git work tree"])
     return Path(result.stdout.strip()).resolve()
@@ -120,6 +125,7 @@ class _Loader:
         self.resolver = resolver
         self.placeholders: list[Placeholder] = []
         self.problems: list[str] = []
+        self.failed: set[tuple[str, str]] = set()
 
     def table(self, table: dict[str, Any], path: str, owner: str) -> dict[str, Any]:
         return {name: self.value(v, f"{path}.{name}", owner, name) for name, v in table.items()}
@@ -137,6 +143,13 @@ class _Loader:
                 resolved = self.resolver.resolve(ref)
             except ResolveError as exc:
                 self.problems.append(f"{path}: {exc}")
+                self.failed.add((owner, field))
+                return None
+            except (OSError, ValueError) as exc:
+                self.problems.append(
+                    f"{path}: {ref.describe()} cannot be read ({type(exc).__name__})"
+                )
+                self.failed.add((owner, field))
                 return None
             if not isinstance(resolved, LazySsm):
                 self.find_placeholders(resolved, path, owner, field, ref)
@@ -203,6 +216,9 @@ def load_contract(path: Path) -> Contract:
             problems.append(f"{where}: an identity cannot use an ssm reference")
             continue
         skip = {p.field for p in loader.placeholders if p.owner == where}
+        skip |= {field for owner, field in loader.failed if owner == where}
+        if skip and (("role" in resolved) == ("permission_set" in resolved)):
+            problems.append(f"{where}: give exactly one of role or permission_set")
         problems.extend(f"{where}.{p}" for p in field_problems(Identity, resolved, skip))
         identity_data[alias] = resolved
 

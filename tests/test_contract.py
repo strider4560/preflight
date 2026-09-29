@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from conftest import write
 
@@ -116,3 +118,53 @@ def test_changed_inputs(repo):
     contract = load_contract(setup(repo))
     (repo / "envs/dev.tfvars").write_text(TFVARS + 'extra = "1"\n')
     assert contract.changed_inputs() == ["envs/dev.tfvars"]
+
+
+def test_a_malformed_glob_is_a_contract_error(repo):
+    bad = 'schema_version = 1\nenvironment = "dev"\n[s]\nx = { yaml_glob = "a/**b/*.yaml" }\n'
+    with pytest.raises(ContractError):
+        load_contract(setup(repo, contract=bad))
+
+
+def test_a_nul_in_a_path_is_a_contract_error(repo):
+    bad = 'schema_version = 1\nenvironment = "dev"\n[s]\nx = { yaml = "a\\u0000b" }\n'
+    with pytest.raises(ContractError):
+        load_contract(setup(repo, contract=bad))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+def test_an_unreadable_referenced_file_is_a_contract_error(repo):
+    path = setup(repo)
+    secret = repo / "envs/dev.tfvars"
+    secret.chmod(0)
+    try:
+        with pytest.raises(ContractError, match="cannot be read"):
+            load_contract(path)
+    finally:
+        secret.chmod(0o644)
+
+
+def test_missing_git_is_a_contract_error(repo, monkeypatch):
+    path = setup(repo)
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(ContractError, match="git is not available"):
+        load_contract(path)
+
+
+def test_a_placeholder_does_not_hide_the_identity_model_check(repo):
+    tfvars = 'account_id = "000000000000"\nroot_domain = "tellabs.dev"\nzones = ["app"]\n'
+    bad = CONTRACT.replace(
+        'permission_set = "AWSAdministratorAccess"',
+        'permission_set = "AWSAdministratorAccess"\nrole = "x"',
+    )
+    with pytest.raises(ContractError, match="give exactly one of role or permission_set"):
+        load_contract(setup(repo, tfvars=tfvars, contract=bad))
+
+
+def test_a_failed_identity_reference_is_reported_once(repo):
+    bad = CONTRACT.replace('key = "account_id"', 'key = "missing"')
+    with pytest.raises(ContractError) as caught:
+        load_contract(setup(repo, contract=bad))
+    mentions = [p for p in caught.value.problems if "account_id" in p]
+    assert len(mentions) == 1
+    assert "has no variable missing" in mentions[0]
