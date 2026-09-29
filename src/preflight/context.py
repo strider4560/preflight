@@ -31,7 +31,7 @@ class ModuleFailed(Exception):
 
 
 def _literal(value: str) -> str:
-    if not SAFE.match(value):
+    if not SAFE.fullmatch(value):
         raise ValueError("value is not safe to place in a lookup expression")
     return f"'{value}'"
 
@@ -95,14 +95,19 @@ class Context:
         *,
         identity: Identity | None = None,
         ambient: bool = False,
-        expect: tuple[str, ...] = (),
+        expect: tuple[str, ...],
     ) -> dict[str, Any]:
         chosen = self._identity(identity)
         payload = {**(args or {}), "region": chosen.region}
         if not ambient:
             payload["profile"] = chosen.profile
         result = self.ansible_host.ansible(module, json.dumps(payload), check=True)
-        if result.get("failed") or any(key not in result for key in expect):
+        if (
+            result.get("failed")
+            or result.get("unreachable")
+            or result.get("exception")
+            or any(key not in result for key in expect)
+        ):
             raise ModuleFailed(module)
         return result
 

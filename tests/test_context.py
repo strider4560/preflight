@@ -10,8 +10,8 @@ from preflight import context as context_module
 def test_aws_modules_get_the_profile_and_region(tmp_path):
     ansible = FakeAnsibleHost({"amazon.aws.aws_caller_info": {"account": "1"}})
     ctx = make_ctx(tmp_path, ansible=ansible)
-    assert ctx.aws_module("amazon.aws.aws_caller_info") == {"account": "1"}
-    ctx.aws_module("amazon.aws.aws_caller_info", {"x": 1}, ambient=True)
+    assert ctx.aws_module("amazon.aws.aws_caller_info", expect=("account",)) == {"account": "1"}
+    ctx.aws_module("amazon.aws.aws_caller_info", {"x": 1}, ambient=True, expect=("account",))
     assert ansible.calls == [
         ("amazon.aws.aws_caller_info", {"region": "us-east-1", "profile": "sandbox"}),
         ("amazon.aws.aws_caller_info", {"x": 1, "region": "us-east-1"}),
@@ -38,7 +38,7 @@ def test_ssm_lookup_refuses_unsafe_names(tmp_path):
 
 def test_a_check_without_an_identity_cannot_call_aws(tmp_path):
     with pytest.raises(RuntimeError, match="no identity"):
-        make_ctx(tmp_path, identity=None, ansible=FakeAnsibleHost({})).aws_module("m")
+        make_ctx(tmp_path, identity=None, ansible=FakeAnsibleHost({})).aws_module("m", expect=())
 
 
 def test_the_ansible_host_uses_a_local_inventory_with_this_python(monkeypatch):
@@ -50,7 +50,7 @@ def test_the_ansible_host_uses_a_local_inventory_with_this_python(monkeypatch):
         return "host"
 
     monkeypatch.setattr(context_module.testinfra, "get_host", fake_get_host)
-    monkeypatch.delenv("ANSIBLE_CONFIG", raising=False)
+    monkeypatch.setenv("ANSIBLE_CONFIG", "")
     assert context_module.make_ansible_host() == "host"
     assert captured["spec"] == "ansible://localhost"
     assert captured["inventory"] == (
@@ -71,7 +71,7 @@ def test_aws_module_raises_when_an_expected_key_is_missing(tmp_path):
 def test_aws_module_raises_when_the_result_says_failed(tmp_path):
     ansible = FakeAnsibleHost({"m": {"failed": True, "msg": "secret detail"}})
     with pytest.raises(context_module.ModuleFailed) as raised:
-        make_ctx(tmp_path, ansible=ansible).aws_module("m")
+        make_ctx(tmp_path, ansible=ansible).aws_module("m", expect=())
     assert str(raised.value) == "m"
 
 
@@ -94,3 +94,23 @@ def test_ssm_lookup_raises_when_the_result_says_failed(tmp_path):
     ansible = FakeAnsibleHost({"ansible.builtin.debug": {"failed": True}})
     with pytest.raises(context_module.ModuleFailed):
         make_ctx(tmp_path, ansible=ansible).ssm_lookup("/a/b")
+
+
+def test_ssm_lookup_refuses_a_trailing_newline(tmp_path):
+    ctx = make_ctx(tmp_path, ansible=FakeAnsibleHost({}))
+    with pytest.raises(ValueError):
+        ctx.ssm_lookup("/a/b\n")
+
+
+@pytest.mark.parametrize("marker", ["unreachable", "exception"])
+def test_aws_module_raises_on_unreachable_or_exception_results(tmp_path, marker):
+    ansible = FakeAnsibleHost({"m": {marker: True, "account": "1"}})
+    with pytest.raises(context_module.ModuleFailed) as raised:
+        make_ctx(tmp_path, ansible=ansible).aws_module("m", expect=("account",))
+    assert str(raised.value) == "m"
+
+
+def test_aws_module_requires_expect(tmp_path):
+    ctx = make_ctx(tmp_path, ansible=FakeAnsibleHost({"m": {}}))
+    with pytest.raises(TypeError):
+        ctx.aws_module("m")
