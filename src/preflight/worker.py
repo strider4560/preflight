@@ -6,6 +6,7 @@ process group when the instance runs out of time."""
 
 from __future__ import annotations
 
+import datetime
 import importlib
 import json
 import os
@@ -49,6 +50,8 @@ class Job:
 
 
 def encode_data(value: Any) -> Any:
+    if isinstance(value, datetime.date | datetime.time):  # datetime is a date
+        return value.isoformat()
     if isinstance(value, LazySsm):
         return value.to_dict()
     if isinstance(value, dict):
@@ -105,7 +108,7 @@ def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> O
             alias: Identity.model_validate(spec) for alias, spec in job.identities.items()
         }
         identity = Identity.model_validate(job.identity) if job.identity else None
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         return outcome(
             error(
                 do=f"Preflight could not load {job.check_id} ({type(exc).__name__}).",
@@ -119,7 +122,7 @@ def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> O
         data = _resolve_lazy(decode_data(job.data), ctx)
     except _Unresolved as exc:
         return outcome(error(do=str(exc), error_type="Unresolved"))
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         return outcome(
             error(
                 do=(
@@ -144,7 +147,7 @@ def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> O
         )
     try:
         result = check.observe(ctx, section)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         return outcome(
             error(
                 do=(
@@ -169,6 +172,7 @@ def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> O
 
 _LIVE: set[subprocess.Popen] = set()
 _LIVE_LOCK = threading.Lock()
+_STOPPING = False
 
 
 def _kill_group(process: subprocess.Popen) -> None:
@@ -179,16 +183,56 @@ def _kill_group(process: subprocess.Popen) -> None:
 
 
 def kill_all() -> None:
+    """Stops every live worker and makes later launches refuse until `reset_stop`."""
+    global _STOPPING
     with _LIVE_LOCK:
+        _STOPPING = True
         for process in list(_LIVE):
             _kill_group(process)
+
+
+def reset_stop() -> None:
+    global _STOPPING
+    with _LIVE_LOCK:
+        _STOPPING = False
+
+
+def _interrupted() -> Outcome:
+    return outcome(error(do="Preflight was interrupted.", error_type="Interrupted"))
+
+
+def _reap(process: subprocess.Popen) -> None:
+    """Reaps a killed worker without waiting on a pipe a detached descendant may hold open."""
+    if process.stdout:
+        process.stdout.close()
+    if process.stdin:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _kill_group(process)
 
 
 def launch(
     job: Job, *, env: Mapping[str, str], timeout: float, python: str = sys.executable
 ) -> Outcome:
+    try:
+        payload = job.to_json()
+    except (TypeError, ValueError):
+        return outcome(
+            error(
+                do="The contract data for this check cannot be passed to a worker.",
+                error_type="TypeError",
+            )
+        )
+    with _LIVE_LOCK:
+        if _STOPPING:
+            return _interrupted()
     process = subprocess.Popen(
-        [python, "-m", "preflight.worker"],
+        [python, "-P", "-m", "preflight.worker"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -198,13 +242,19 @@ def launch(
         text=True,
     )
     with _LIVE_LOCK:
-        _LIVE.add(process)
+        stopping = _STOPPING
+        if not stopping:
+            _LIVE.add(process)
+    if stopping:
+        _kill_group(process)
+        _reap(process)
+        return _interrupted()
     try:
         try:
-            stdout, _ = process.communicate(job.to_json(), timeout=timeout)
+            stdout, _ = process.communicate(payload, timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(process)
-            process.communicate()
+            _reap(process)
             return outcome(
                 error(
                     do=(
@@ -243,14 +293,14 @@ def launch(
 
 def main() -> int:
     job = Job.from_json(sys.stdin.read())
-    real_stdout = sys.stdout
-    sys.stdout = sys.stderr  # a check that prints cannot corrupt the result
-    try:
-        result = execute(job)
-    finally:
-        sys.stdout = real_stdout
-    real_stdout.write(json.dumps(result.to_dict(), default=str))
-    real_stdout.flush()
+    # The result pipe moves to a private, non-inheritable descriptor, so neither the check's
+    # prints nor a descendant it leaves behind can touch or hold open the result.
+    result_fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    result = execute(job)
+    with os.fdopen(result_fd, "w") as sink:
+        sink.write(json.dumps(result.to_dict(), default=str))
     return 0
 
 
