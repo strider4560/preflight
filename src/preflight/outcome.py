@@ -18,7 +18,7 @@ class Status(StrEnum):
 
 
 # Worst first: an outcome takes the worst status among its blocking items.
-SEVERITY = (Status.ERROR, Status.FAIL, Status.PENDING, Status.OK)
+SEVERITY = (Status.ERROR, Status.BLOCKED, Status.FAIL, Status.PENDING, Status.OK)
 
 
 @dataclass(frozen=True)

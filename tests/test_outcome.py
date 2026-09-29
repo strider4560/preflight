@@ -4,6 +4,7 @@ import json
 import pytest
 
 from preflight.outcome import (
+    Item,
     Outcome,
     Status,
     apply_remedy,
@@ -65,3 +66,8 @@ def test_remedy_fills_empty_fields_and_replaces_only_a_generic_do():
 def test_remedy_leaves_ok_items_alone():
     merged = apply_remedy(outcome(ok("a")), {"do": "x"}, {})
     assert merged.items[0].next_step is None
+
+
+def test_a_blocked_item_never_reads_as_ok():
+    assert Outcome((Item("a", Status.BLOCKED),)).status is Status.BLOCKED
+    assert outcome(ok("a"), Item("b", Status.BLOCKED, advisory=True)).status is Status.OK
