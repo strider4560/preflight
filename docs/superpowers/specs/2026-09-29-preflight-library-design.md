@@ -235,7 +235,7 @@ Each check instance runs in its own worker process, started in a new session (it
   - AWS credential variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_SECURITY_TOKEN`, `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME`, `AWS_WEB_IDENTITY_TOKEN_FILE`;
   - OpenTofu overrides: `TF_CLI_ARGS`, `TF_CLI_ARGS_*`, `TF_WORKSPACE`, `TF_VAR_*`;
   
-  plus `AWS_PROFILE`, `AWS_REGION` and `AWS_DEFAULT_REGION` for the instance's identity when it has one. The directory of preflight's own executables is prepended to `PATH`, so the `ansible` command from the same environment is found. `aws.ambient` alone runs with the caller's AWS variables intact.
+  plus `AWS_PROFILE`, `AWS_REGION` and `AWS_DEFAULT_REGION` for the instance's identity when it has one. The directory of preflight's own executables is prepended to `PATH`, so the `ansible` command from the same environment is found. `aws.assumed` alone runs with the caller's AWS variables intact.
 - **Hosts:** the context gives two testinfra hosts:
   - `ctx.host` = `testinfra.get_host("local://")`, for `host.run`, `host.file`, `host.exists`;
   - `ctx.ansible` = `testinfra.get_host("ansible://localhost")` with a generated inventory: `ansible_connection=local` and `ansible_python_interpreter=<preflight's Python>`, so modules find boto3. AWS modules always receive the identity's `profile` and `region` explicitly as module arguments.
@@ -255,7 +255,7 @@ gate = Gate(
     "bootstrap_entry",
     guards="scripts/bootstrap.sh",
     requires=["identifiers"],
-    checks=[aws.ambient("admin"), aws.region("admin"), git.up_to_date("branch")],
+    checks=[aws.assumed("admin"), aws.region("admin"), git.up_to_date("branch")],
 )
 ```
 
@@ -321,7 +321,7 @@ preflight validate [--gates DIR] [--contracts DIR]
 | Check | Observes through | Semantics |
 |---|---|---|
 | `aws.session[<identity>]` | `amazon.aws.aws_caller_info` with the identity's `profile` | Account and role match. `error` "run `aws sso login --profile <profile>`" |
-| `aws.ambient[<identity>]` | `amazon.aws.aws_caller_info` with no profile, in the caller's unmodified environment | Same match, for what the caller's next command will use. `fail` names the variable to set or unset (`export AWS_PROFILE=sandbox`, `unset AWS_ACCESS_KEY_ID …`) |
+| `aws.assumed[<identity>]` | `amazon.aws.aws_caller_info` with no profile, in the caller's unmodified environment | Same match, for what the caller's next command will use. `fail` names the variable to set or unset (`export AWS_PROFILE=sandbox`, `unset AWS_ACCESS_KEY_ID …`) |
 | `aws.region[<identity>]` | `host.run("aws configure get region --profile <p>")` | The profile's configured region equals the identity's `region` |
 | `ssm.present[<name>]` | the `amazon.aws.aws_ssm` lookup (`decrypt=False`) through `ansible.builtin.debug` | Exists, non-empty, not `SecureString`. Mostly implicit, from lazy references |
 | `ssm.parameters` | as above | Every listed name is present |
@@ -347,7 +347,7 @@ This table is not built under this spec. It records how iac's bootstrap maps ont
 |---|---|---|---|
 | `repository` | milestone, repository scope | — | `github.auth`, `github.repo`, Actions access set to organization, organization variables (both account IDs, so repository scope) |
 | `identifiers` | milestone, repository scope | `repository` | account and GitHub IDs filled (placeholders, with `how` pasting the `gh api` command), accounts distinct, peer and smoke IDs consistent, values committed (repo-local checks) |
-| `bootstrap_entry` | entry, guards `scripts/bootstrap.sh` | `identifiers` | `aws.ambient[admin]`, `aws.region[admin]`, `git.up_to_date` |
+| `bootstrap_entry` | entry, guards `scripts/bootstrap.sh` | `identifiers` | `aws.assumed[admin]`, `aws.region[admin]`, `git.up_to_date` |
 | `bootstrap` | milestone | `identifiers` | `tofu.plan_clean(stacks/bootstrap)` with remedy "rerun `scripts/bootstrap.sh {environment}` from an up-to-date main"; `ssm.parameters` for bootstrap's parameters (`/platform/state/*`, `/platform/oidc/provider_arn`, `/platform/dns/zone_ids`, `/platform/dns/name_servers`, `/platform/dns/root_certificate_arn`, `/platform/bootstrap/applied_from`); no leftover local state |
 | `delegation` | milestone | `bootstrap` | `dns.delegated` per zone, `dns.undelegated` per retired zone, `acm.issued` for the root certificate, `dns.caa` on the root. `bootstrap.sh` calls this gate at its end as guidance |
 | `github` | milestone, repository scope | `bootstrap` | `platform-dev` and `platform-prod` environments; `main` ruleset requiring `validate`, `plans` and later `bootstrap_applied`, with enforcement active; `v*` tag ruleset |
@@ -406,7 +406,7 @@ All offline: no AWS, no network, no credentials.
 - **Workers:**
   - environment scrubbing;
   - identity environment;
-  - `aws.ambient` keeping the caller's variables;
+  - `aws.assumed` keeping the caller's variables;
   - the working directory;
   - output never leaving the worker.
 - **Catalog:**
