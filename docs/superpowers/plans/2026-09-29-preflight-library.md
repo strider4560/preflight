@@ -7427,4 +7427,67 @@ Recorded by Task 1 on 2026-09-29. Environment: `uv venv` plus `ansible>=11`, `py
 
 ## Acceptance results
 
-Task 26 fills this in: each instance's status against Sandbox, and any follow-up fixes.
+Recorded by Task 26 on 2026-09-29, run from the worktree (`uv run --project .worktrees/preflight-library preflight ...`) against Sandbox. The operator's `sandbox` SSO session and `gh` login were already live. The scratch consumer was a fresh `git init` directory outside every repository, and it was deleted afterwards. Tools: OpenTofu 1.12.6, gh 2.86.0, aws CLI v2.
+
+- **Account ID:** read from `expected_account_id` in the main checkout's `contracts/sandbox.local.toml`. `preflight validate` accepted the brief's contract unchanged (`1 gates, 2 contracts: valid`), so no section-model adjustments were needed.
+- **How "logged out" was simulated:** the real session was not logged out. Instead the run used a copy of the contract with `profile = "preflight-acceptance-missing"` (a profile that does not exist) and `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` unset.
+
+**Run 1, simulated logged out** (exit 1; 3 ok, 3 fail, 2 error, 2 blocked):
+
+| Instance | Status | Next step accurate and actionable? |
+|---|---|---|
+| `aws.session[admin]` | error (`ModuleFailed`) | Partly. It pastes `aws sso login --profile preflight-acceptance-missing`, the brief's expected shape. For a profile that does not exist, though, that command cannot succeed (follow-up 1). For a real expired session the text is right. |
+| `aws.assumed[admin]` | ok | Correct for this machine. The operator's `[default]` profile is an SSO profile for the same account and permission set, so the bare shell does act as the identity. The brief expected `export AWS_PROFILE=sandbox`, which assumed a different default profile. A separate probe with `AWS_PROFILE=preflight-acceptance-missing` in the shell (and the real contract) gave `error` with `export AWS_PROFILE=sandbox` and `aws sso login --profile sandbox`, as the brief expects. |
+| `aws.region[admin]` | error (`AwsCli`) | Yes: "Profile ... is not configured; add it to ~/.aws/config", pasting `aws configure sso --profile ...`. This is the true cause in this simulation. |
+| `ssm.parameters[bootstrap_params]` | blocked (waits on `aws.session[admin]`) | Correct, as expected. |
+| `tofu.plan_clean[bootstrap_stack]` | blocked (waits on `aws.session[admin]`) | Correct, as expected. |
+| `dns.delegated[acceptance_zone]:preflight-acceptance` | fail | Yes (same as run 2). |
+| `dns.caa[root_caa]` | fail | Yes (same as run 2). |
+| `github.auth[repository]` | ok | |
+| `github.repo[repository]:exists` | ok | |
+| `github.workflow_green[platform_run]` | fail | Yes (same as run 2). |
+
+**Run 2, logged in** (`AWS_PROFILE=sandbox`, `--json`; exit 1; 9 ok, 4 fail, 0 pending, 0 error, 0 blocked, counting items, with `acm.issued` added per Step 3):
+
+| Instance | Status | Next step accurate and actionable for the account's actual state? |
+|---|---|---|
+| `aws.session[admin]` | ok | observed: the Sandbox account, `assumed-role/AWSReservedSSO_AWSAdministratorAccess_…` |
+| `aws.assumed[admin]` | ok | same observed |
+| `aws.region[admin]` | ok | observed `us-east-1` |
+| `ssm.parameters[bootstrap_params]:/platform/state/bucket` | ok | `observed` is null; no value reached the report |
+| `ssm.parameters[bootstrap_params]:/platform/state/kms_key_arn` | ok | as above |
+| `ssm.parameters[bootstrap_params]:/platform/oidc/provider_arn` | ok | as above |
+| `tofu.plan_clean[bootstrap_stack]` | ok | 17 s. The plan is clean, matching an applied bootstrap stack. |
+| `dns.delegated[acceptance_zone]:preflight-acceptance` | fail | Yes. The `tellabs.dev` servers (`ns-129.awsdns-16.com`, `+norec`) answer NXDOMAIN for `NS preflight-acceptance.tellabs.dev`. The paste is exactly the two-line NS block (see Acceptance 4). The lead-in wording is slightly ambiguous (follow-up 3). |
+| `dns.caa[root_caa]` | fail | Yes. `tellabs.dev` has no CAA record at its own servers (NOERROR, empty answer). It pastes `tellabs.dev. CAA 0 issue "amazon.com"`. The `wait` text overstates the delay (follow-up 2). |
+| `github.auth[repository]` | ok | |
+| `github.repo[repository]:exists` | ok | |
+| `github.workflow_green[platform_run]` | fail | Yes. `gh api` shows the latest `platform.yml` run on `main` (36519332358, a push on 2026-09-29) concluded `cancelled` in `apply_dev_edge / Apply`. The earlier runs succeeded. The pasted run URL is the right one. |
+| `acm.issued[pending_cert]` | fail | Yes (see below). |
+
+The JSON report was written with mode 0600, with `inputs_changed: []` and `next: dns.delegated[acceptance_zone]:preflight-acceptance`. No `__pycache__` appeared in the scratch consumer, and no `preflight-tofu-*` data directory was left in `/tmp`.
+
+**Acceptance 4: delegation.** `dns.delegated[acceptance_zone]:preflight-acceptance` failed with exactly this two-line block, with `observed: []`:
+
+```
+preflight-acceptance.tellabs.dev. NS ns-1.example.com.
+preflight-acceptance.tellabs.dev. NS ns-2.example.com.
+```
+
+**Acceptance 4: `acm.issued`.** Sandbox has one `PENDING_VALIDATION` certificate in us-east-1, `*.tellabs.dev` with SAN `tellabs.dev`, requested 2026-09-29T03:58Z. It was added as `[pending_cert]` and the logged-in run was repeated; the table above is that run. `acm.issued[pending_cert]` reported `fail` with the single validation record, deduplicated across both SANs:
+
+```
+_9f15b3dd9a1638b370a0136b911aeae3.tellabs.dev. CNAME _eac68e940b84cf1eec536b9ae3e6ab67.wzccmgtwzk.acm-validations.aws.
+```
+
+The record is indeed absent: the `tellabs.dev` servers answer NXDOMAIN for it. The check depends only on `aws.session[admin]`, and it reported this independently of the failing delegation.
+
+**iac repository.** `git -C iac status --short stacks/bootstrap` printed nothing before and nothing after the runs. `--ignored` showed only `stacks/bootstrap/.terraform/`, both before and after; that directory predates the runs (08:48 local time). A `find -printf '%p %T@ %s'` listing of `stacks/bootstrap`, which covers every path, mtime and size, was identical before and after. No `__pycache__` exists there, and no new `.terraform` directory appeared. `tofu.plan_clean` uses a throwaway `TF_DATA_DIR`, `init -lockfile=readonly` and `plan -lock=false`, so it takes no state lock and writes no `.tflock`. The S3 bucket was not listed, because that call is outside this task's read-only set.
+
+**Follow-ups** (each gets its own fix and test; no library code was changed in this task):
+
+1. For a profile missing from `~/.aws/config`, `aws.session` says "Sign in to profile X" and pastes `aws sso login --profile X`, which cannot succeed. It becomes NEXT, ahead of `aws.region`'s correct "not configured; `aws configure sso --profile X`". `aws.session` should tell a missing profile apart from an expired session, and paste the configure command for a missing profile.
+2. The `dns.caa` `wait` text says resolvers may cache the old answer for "the zone's negative-cache TTL (its SOA minimum)". Under RFC 2308, the negative TTL is the smaller of the SOA record's own TTL and its MINIMUM field. For `tellabs.dev` those are 900 s and 86400 s, so the text suggests up to a day where the real wait is at most 15 minutes. Correct the wording, or compute the value from the SOA it observed.
+3. "In the zone that holds tellabs.dev" (`dns.delegated`) and "in the zone that holds them" (`acm.issued`) can be read as the parent `.dev` zone rather than the `tellabs.dev` hosted zone itself. Something like "In the tellabs.dev zone (wherever it is hosted)" would be clearer. Low priority.
+4. Spec Acceptance 3 asks for every catalog check to run once against Sandbox, but Task 26's gate covers only `aws.*`, `ssm.parameters`, `tofu.plan_clean`, `dns.delegated`, `dns.caa`, `github.auth`, `github.repo`, `github.workflow_green` and `acm.issued`. These were not exercised live: `ssm.present` as a standalone check, `dns.undelegated`, `dns.cname`, `github.variables`, `github.environments`, `github.ruleset`, `github.secret_names`, `git.up_to_date`, `files.*` and `sops.rule`. Either extend the acceptance gate or narrow the spec's wording.
+5. This one is unclear, not a library defect. The brief expects `aws.assumed` to name `export AWS_PROFILE=sandbox` when logged out. On a machine whose `[default]` profile is the same account and permission set, `ok` is the correct answer. The brief's expectation should say it depends on the shell's default profile. Also, the logged-out path was simulated with a missing profile; a genuinely expired SSO token was not exercised live.
