@@ -1,7 +1,9 @@
 import json
 import re
 
+import pytest
 from fakes import FakeAnsibleHost, make_ctx
+from pydantic import ValidationError
 from testinfra.modules.ansible import AnsibleException
 
 from preflight.catalog import ssm
@@ -61,3 +63,8 @@ def test_lookup_failure_message_is_an_error_and_not_leaked(tmp_path):
     assert "SECRET" not in json.dumps(item.to_dict())
     single = ssm.present.observe(ctx, ssm.PresentSection(identity="admin", name="/a")).items[0]
     assert (single.status, single.error_type) == (Status.ERROR, "ModuleFailed")
+
+
+def test_parameter_names_are_unique():
+    with pytest.raises(ValidationError, match="duplicate entries: /a"):
+        ssm.ParametersSection(identity="admin", names=["/a", "/b", "/a"])

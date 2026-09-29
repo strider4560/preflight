@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
-from preflight.check import Section, check
+from preflight.check import Section, check, unique_by
 from preflight.dnsclient import DnsUnavailable, norm
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
 
@@ -22,15 +22,19 @@ NEGATIVE_CACHE = (
 )
 
 
+# Names compare as DNS does: without case or a trailing dot.
+Zones = Annotated[list[Label], AfterValidator(unique_by(norm))]
+
+
 class DelegationSection(Section):
     root: Domain
-    zones: list[Label]
-    name_servers: dict[str, list[str]]
+    zones: Zones
+    name_servers: dict[Label, list[Domain]]
 
 
 class UndelegatedSection(Section):
     root: Domain
-    zones: list[Label] = []
+    zones: Zones = []
 
 
 class CnameRecord(BaseModel):
@@ -40,12 +44,14 @@ class CnameRecord(BaseModel):
 
 
 class CnameSection(Section):
-    records: list[CnameRecord]
+    records: Annotated[
+        list[CnameRecord], AfterValidator(unique_by(lambda record: norm(record.name)))
+    ]
 
 
 class CaaSection(Section):
     domain: Domain
-    issuers: list[str]
+    issuers: list[Domain] = Field(min_length=1)
 
 
 def ns_block(name: str, servers) -> str:
@@ -96,11 +102,12 @@ def delegated(ctx, s: DelegationSection) -> Outcome:
             fail(
                 prefix,
                 do=(
-                    f"In Administration, set the NS record for {name} in {root} to exactly "
+                    f"In the zone that holds {root}, set the NS record for {name} to exactly "
                     "these servers, replacing any others:"
                 ),
                 paste=ns_block(name, expected),
                 observed=sorted(referral.servers),
+                generic=True,
             )
         )
     return _all(items)
@@ -124,10 +131,11 @@ def undelegated(ctx, s: UndelegatedSection) -> Outcome:
                 fail(
                     prefix,
                     do=(
-                        f"In Administration, remove the NS record for {name} from {root}; a "
+                        f"In the zone that holds {root}, remove the NS record for {name}; a "
                         "delegation to a zone being retired is a takeover risk."
                     ),
                     observed=sorted(referral.servers),
+                    generic=True,
                 )
             )
     return _all(items)

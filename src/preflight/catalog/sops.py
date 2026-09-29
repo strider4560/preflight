@@ -8,12 +8,12 @@ import re
 import yaml
 from pydantic import Field
 
-from preflight.check import Section, check
+from preflight.check import Section, UniqueList, check
 from preflight.outcome import Outcome, error, fail, ok, outcome
 
 
 class SopsRuleSection(Section):
-    paths: list[str] = Field(min_length=1)
+    paths: UniqueList[str] = Field(min_length=1)
     min_recipients: int = Field(default=1, ge=1)
     config: str = ".sops.yaml"
 
@@ -74,7 +74,7 @@ def rule(ctx, s: SopsRuleSection) -> Outcome:
                 fail(path, do=f"Add a creation rule to {s.config} whose path_regex matches {path}.")
             )
             continue
-        count = len(_recipients(match))
+        count = len(set(_recipients(match)))
         if count < s.min_recipients:
             items.append(
                 fail(

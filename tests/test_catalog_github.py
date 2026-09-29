@@ -30,7 +30,11 @@ def test_auth(tmp_path):
     assert run(github.auth, section, tmp_path, ok_host).status is Status.OK
     bad_host = FakeHost([("gh auth status", FakeResult(1))])
     item = run(github.auth, section, tmp_path, bad_host).items[0]
-    assert (item.status, item.next_step.paste) == (Status.FAIL, "gh auth login")
+    assert (item.status, item.next_step.paste, item.error_type) == (
+        Status.ERROR,
+        "gh auth login",
+        "GhAuth",
+    )
 
 
 def test_repo_and_actions_access(tmp_path):
@@ -178,6 +182,8 @@ def test_variable_value_with_quote_round_trips_through_shlex(tmp_path):
         lambda: github.SecretNamesSection(repo="a/b", names=["1BAD"]),
         lambda: github.SecretNamesSection(repo="a/b", names=["OK"], environment="x y"),
         lambda: github.EnvironmentsSection(repo="a/b", environments=["a;b"]),
+        lambda: github.EnvironmentsSection(repo="a/b", environments=["dev", "dev"]),
+        lambda: github.SecretNamesSection(repo="a/b", names=["TOKEN", "TOKEN"]),
     ],
 )
 def test_names_are_validated(build):

@@ -4,14 +4,20 @@ never fetches, so checking changes nothing."""
 from __future__ import annotations
 
 import shlex
+from typing import Annotated
+
+from pydantic import StringConstraints
 
 from preflight.check import Section, check
 from preflight.outcome import Outcome, error, fail, ok, outcome
 
+# No leading "-" (git would read an option) and no glob characters (ls-remote matches patterns).
+GitName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")]
+
 
 class UpToDateSection(Section):
-    remote: str = "origin"
-    branch: str = "main"
+    remote: GitName = "origin"
+    branch: GitName = "main"
 
 
 @check("git.up_to_date", section=UpToDateSection)

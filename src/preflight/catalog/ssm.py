@@ -7,7 +7,7 @@ from typing import Annotated
 
 from pydantic import Field, StringConstraints
 
-from preflight.check import IdentityRef, Section, check, session_for
+from preflight.check import IdentityRef, Section, UniqueList, check, session_for
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
 
 SsmName = Annotated[str, StringConstraints(pattern=r"^/[A-Za-z0-9_.\-/]+$")]
@@ -21,7 +21,7 @@ class PresentSection(Section):
 
 class ParametersSection(Section):
     identity: IdentityRef
-    names: list[SsmName] = Field(min_length=1)
+    names: UniqueList[SsmName] = Field(min_length=1)
     how: str | None = None
 
 

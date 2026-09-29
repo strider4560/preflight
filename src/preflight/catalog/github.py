@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from pydantic import Field, StringConstraints, model_validator
 
-from preflight.check import Section, check
+from preflight.check import Section, UniqueList, check
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
 
 Repo = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
@@ -128,7 +128,13 @@ def auth(ctx, s: AuthSection) -> Outcome:
         return outcome(error(do="Install the GitHub CLI (gh).", error_type="MissingTool"))
     if result.rc == 0:
         return outcome(ok())
-    return outcome(fail(do=f"Sign in to {s.hostname} with the GitHub CLI.", paste="gh auth login"))
+    return outcome(
+        error(
+            do=f"Sign in to {s.hostname} with the GitHub CLI.",
+            paste="gh auth login",
+            error_type="GhAuth",
+        )
+    )
 
 
 class RepoSection(Section):
@@ -224,7 +230,7 @@ def variables(ctx, s: VariablesSection) -> Outcome:
 
 class EnvironmentsSection(Section):
     repo: Repo
-    environments: list[EnvName] = Field(min_length=1)
+    environments: UniqueList[EnvName] = Field(min_length=1)
 
 
 @check("github.environments", section=EnvironmentsSection)
@@ -317,7 +323,7 @@ def ruleset(ctx, s: RulesetSection) -> Outcome:
 class SecretNamesSection(Section):
     repo: Repo
     environment: EnvName | None = None
-    names: list[Name] = Field(min_length=1)
+    names: UniqueList[Name] = Field(min_length=1)
 
 
 @check("github.secret_names", section=SecretNamesSection)

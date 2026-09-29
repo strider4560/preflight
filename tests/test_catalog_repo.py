@@ -1,6 +1,8 @@
 import shlex
 
+import pytest
 from fakes import FakeHost, FakeResult, make_ctx
+from pydantic import ValidationError
 
 from preflight.catalog import files, git, sops
 from preflight.outcome import Status
@@ -32,24 +34,73 @@ def test_up_to_date(tmp_path):
     assert not any("fetch" in c for c in ok_host.commands + behind.commands + offline.commands)
 
 
-def test_up_to_date_missing_branch_and_quoted_paste(tmp_path):
+def test_up_to_date_missing_branch_and_paste(tmp_path):
     empty = FakeHost([("ls-remote", FakeResult(0, ""))])
     item = run(git.up_to_date, git.UpToDateSection(), tmp_path, empty).items[0]
     assert item.status is Status.FAIL
     assert "does not exist on origin" in item.next_step.do
-    odd = git.UpToDateSection(remote="my remote", branch="feat/it's")
+    other = git.UpToDateSection(remote="upstream", branch="release/1.2")
     remote = ("ls-remote", FakeResult(0, f"{SHA}\trefs/heads/x\n"))
     behind = FakeHost([remote, ("cat-file", FakeResult(0)), ("merge-base", FakeResult(1))])
-    paste = run(git.up_to_date, odd, tmp_path, behind).items[0].next_step.paste
-    assert shlex.split(paste) == [
+    paste = run(git.up_to_date, other, tmp_path, behind).items[0].next_step.paste
+    assert paste == "git fetch upstream && git rebase upstream/release/1.2"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"remote": "--upload-pack=x"},
+        {"branch": "-x"},
+        {"remote": "my remote"},
+        {"branch": "feat/it's"},
+        {"branch": "feat/*"},
+        {"branch": ""},
+    ],
+)
+def test_up_to_date_refuses_options_and_globs(fields):
+    with pytest.raises(ValidationError):
+        git.UpToDateSection(**fields)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: files.FilesSection(paths=["a", "b", "a"]),
+        lambda: sops.SopsRuleSection(paths=["secrets/a.yaml", "secrets/a.yaml"]),
+    ],
+)
+def test_duplicate_paths_are_refused(build):
+    with pytest.raises(ValidationError, match="duplicate entries: "):
+        build()
+
+
+def test_git_ignored_on_a_tracked_file_says_to_untrack_it(tmp_path):
+    section = files.FilesSection(paths=["my dir/it's.env"])
+    host = FakeHost([("ls-files", FakeResult(0)), ("check-ignore", FakeResult(1))])
+    item = run(files.git_ignored, section, tmp_path, host).items[0]
+    assert item.status is Status.FAIL
+    assert item.next_step.do == "my dir/it's.env is committed; untrack it, then keep it ignored."
+    assert shlex.split(item.next_step.paste) == [
         "git",
-        "fetch",
-        "my remote",
+        "rm",
+        "--cached",
+        "--",
+        "my dir/it's.env",
         "&&",
-        "git",
-        "rebase",
-        "my remote/feat/it's",
+        "echo",
+        "my dir/it's.env",
+        ">>",
+        ".gitignore",
     ]
+    assert not any("check-ignore" in c for c in host.commands)
+
+
+def test_sops_duplicate_recipients_count_once(tmp_path):
+    config = "creation_rules:\n  - path_regex: secrets/\n    age: age1x,age1x\n"
+    host = FakeHost(files={f"{tmp_path}/.sops.yaml": config})
+    section = sops.SopsRuleSection(paths=["secrets/a.yaml"], min_recipients=2)
+    item = run(sops.rule, section, tmp_path, host).items[0]
+    assert (item.status, item.observed) == (Status.FAIL, 1)
 
 
 def test_files_present_and_absent(tmp_path):
@@ -63,7 +114,7 @@ def test_files_present_and_absent(tmp_path):
 
 def test_files_git_ignored_and_committed(tmp_path):
     section = files.FilesSection(paths=["secrets/prod.sops.yaml"])
-    ignored = FakeHost([("check-ignore", FakeResult(1))])
+    ignored = FakeHost([("ls-files", FakeResult(1)), ("check-ignore", FakeResult(1))])
     item = run(files.git_ignored, section, tmp_path, ignored).items[0]
     assert item.next_step.paste == "echo secrets/prod.sops.yaml >> .gitignore"
     odd = files.FilesSection(paths=["my dir/it's.yaml"])

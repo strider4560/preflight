@@ -1,4 +1,6 @@
+import pytest
 from fakes import FakeDns, make_ctx
+from pydantic import ValidationError
 
 from preflight.catalog import dns
 from preflight.dnsclient import DnsUnavailable, Referral
@@ -97,6 +99,63 @@ def test_cname_with_an_advisory_record(tmp_path):
         items["wiki.tellabs.dev"].next_step.paste == "wiki.tellabs.dev. CNAME wiki.app.tellabs.dev."
     )
     assert result.status is Status.OK
+
+
+def test_delegation_texts_name_no_account_and_can_be_replaced(tmp_path):
+    fake = FakeDns(
+        referrals={
+            "app.tellabs.dev": Referral("none", frozenset()),
+            "old.tellabs.dev": Referral("referral", frozenset({"ns-1.example"})),
+        }
+    )
+    step = run(dns.delegated, delegation(), tmp_path, fake).items[0].next_step
+    assert step.do == (
+        "In the zone that holds tellabs.dev, set the NS record for app.tellabs.dev to exactly "
+        "these servers, replacing any others:"
+    )
+    assert step.generic is True
+    assert step.paste == "app.tellabs.dev. NS ns-1.example.\napp.tellabs.dev. NS ns-2.example."
+    section = dns.UndelegatedSection(root="tellabs.dev", zones=["old"])
+    step = run(dns.undelegated, section, tmp_path, fake).items[0].next_step
+    assert step.do.startswith(
+        "In the zone that holds tellabs.dev, remove the NS record for old.tellabs.dev;"
+    )
+    assert step.generic is True
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: dns.CaaSection(domain="tellabs.dev", issuers=[]),
+        lambda: dns.CaaSection(domain="tellabs.dev", issuers=['amazon.com"; x']),
+        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"": ["ns.example."]}),
+        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"app": ["ns 1 bad"]}),
+        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"app": [""]}),
+        lambda: dns.DelegationSection(root="a.dev", zones=["app", "app"], name_servers={}),
+        lambda: dns.UndelegatedSection(root="a.dev", zones=["old", "old"]),
+        lambda: dns.CnameSection(
+            records=[
+                {"name": "Vault.tellabs.dev", "target": "a.tellabs.dev"},
+                {"name": "vault.tellabs.dev.", "target": "b.tellabs.dev"},
+            ]
+        ),
+    ],
+)
+def test_section_values_are_validated(build):
+    with pytest.raises(ValidationError):
+        build()
+
+
+def test_duplicates_are_named():
+    with pytest.raises(ValidationError, match="duplicate entries: vault.tellabs.dev"):
+        dns.CnameSection(
+            records=[
+                {"name": "Vault.tellabs.dev", "target": "a.tellabs.dev"},
+                {"name": "vault.tellabs.dev.", "target": "b.tellabs.dev"},
+            ]
+        )
+    with pytest.raises(ValidationError, match="duplicate entries: app"):
+        dns.UndelegatedSection(root="a.dev", zones=["app", "api", "app"])
 
 
 def test_caa(tmp_path):

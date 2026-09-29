@@ -7,12 +7,12 @@ import shlex
 
 from pydantic import Field
 
-from preflight.check import Section, check
+from preflight.check import Section, UniqueList, check
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
 
 
 class FilesSection(Section):
-    paths: list[str] = Field(min_length=1)
+    paths: UniqueList[str] = Field(min_length=1)
 
 
 def _exists(ctx, path: str) -> bool:
@@ -34,13 +34,19 @@ def absent(ctx, s: FilesSection) -> Outcome:
 
 
 def _ignored(ctx, path: str) -> Item:
-    result = ctx.host.run("git -C %s check-ignore -q -- %s", str(ctx.root), path)
+    root, quoted = str(ctx.root), shlex.quote(path)
+    # git never reports a tracked file as ignored, so adding it to .gitignore would not help.
+    if ctx.host.run("git -C %s ls-files --error-unmatch -- %s", root, path).rc == 0:
+        return fail(
+            path,
+            do=f"{path} is committed; untrack it, then keep it ignored.",
+            paste=f"git rm --cached -- {quoted} && echo {quoted} >> .gitignore",
+        )
+    result = ctx.host.run("git -C %s check-ignore -q -- %s", root, path)
     if result.rc == 0:
         return ok(path)
     if result.rc == 1:
-        return fail(
-            path, do=f"Add {path} to .gitignore.", paste=f"echo {shlex.quote(path)} >> .gitignore"
-        )
+        return fail(path, do=f"Add {path} to .gitignore.", paste=f"echo {quoted} >> .gitignore")
     return error(path, do="git could not check .gitignore here.", error_type="GitError")
 
 

@@ -40,6 +40,10 @@ def test_pending_without_the_cname_is_the_operators_step(tmp_path):
     item = observe(tmp_path, certificate("PENDING_VALIDATION")).items[0]
     assert item.status is Status.FAIL
     assert item.next_step.paste == "_x.tellabs.dev. CNAME _y.acm-validations.aws."
+    assert item.next_step.do == (
+        "Add the certificate's validation record(s) in the zone that holds them:"
+    )
+    assert item.next_step.generic is True
 
 
 def test_pending_with_the_cname_visible_is_waiting(tmp_path):

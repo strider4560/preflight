@@ -78,9 +78,10 @@ def issued(ctx, s: CertificateSection) -> Outcome:
     if missing:
         return outcome(
             fail(
-                do="In Administration, add the certificate's validation record(s):",
+                do="Add the certificate's validation record(s) in the zone that holds them:",
                 paste="\n".join(f"{norm(r['name'])}. CNAME {norm(r['value'])}." for r in missing),
                 observed=status,
+                generic=True,
             )
         )
     return outcome(
