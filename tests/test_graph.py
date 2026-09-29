@@ -86,6 +86,27 @@ def test_remedy_templates_are_checked(repo):
         plan([Gate("g", checks=[sc.aws_thing("dns")])], contract(repo, text))
 
 
+def test_remedy_templates_cannot_use_ssm_values(repo):
+    text = CONTRACT.replace("{environment}", "{name_servers}")
+    with pytest.raises(GraphError) as caught:
+        plan([Gate("g", checks=[sc.aws_thing("dns")])], contract(repo, text))
+    assert caught.value.problems == [
+        "[dns.remedy].do: {name_servers} is not available in remedies (placeholder or ssm value)"
+    ]
+
+
+def test_remedy_templates_cannot_use_placeholder_values(repo):
+    text = CONTRACT + (
+        '\n[ph]\nname = { tfvars = "envs/dev.tfvars", key = "account_id", '
+        'placeholder = ["000000000000"] }\n\n[ph.remedy]\npaste = "echo {name}"\n'
+    )
+    with pytest.raises(GraphError) as caught:
+        plan([Gate("g", checks=[sc.thing("ph")])], contract(repo, text, account="000000000000"))
+    assert caught.value.problems == [
+        "[ph.remedy].paste: {name} is not available in remedies (placeholder or ssm value)"
+    ]
+
+
 def test_strict_mode_refuses_unused_sections_and_keys(repo):
     text = CONTRACT.replace('items = ["a"]', 'items = ["a"]\nstray = 1')
     gates = [Gate("g", checks=[sc.thing("things")])]

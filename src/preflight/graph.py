@@ -5,6 +5,8 @@ SSM parameters, placeholders), in dependency order."""
 from __future__ import annotations
 
 import heapq
+import re
+import string
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -84,6 +86,15 @@ def iter_lazy(value: Any) -> Iterator[LazySsm]:
     elif isinstance(value, list):
         for element in value:
             yield from iter_lazy(element)
+
+
+def _template_fields(text: str) -> list[str]:
+    """The top-level names a format template refers to; none when it cannot be parsed."""
+    try:
+        parsed = list(string.Formatter().parse(text))
+    except ValueError:
+        return []
+    return [re.split(r"[.\[]", field, maxsplit=1)[0] for _, field, _, _ in parsed if field]
 
 
 class _Builder:
@@ -253,15 +264,20 @@ class _Builder:
         if not isinstance(remedy, dict):
             return
         values = contract.template_values(section)
+        withheld = contract.placeholder_fields(section) | contract.lazy_fields(section)
         for name, text in remedy.items():
             if not isinstance(text, str):
                 continue
             try:
                 text.format_map(values)
             except Exception:
-                self.problems.append(
-                    f"[{section}.remedy].{name}: malformed or unknown template field"
+                named = next((f for f in _template_fields(text) if f in withheld), None)
+                problem = (
+                    f"{{{named}}} is not available in remedies (placeholder or ssm value)"
+                    if named
+                    else "malformed or unknown template field"
                 )
+                self.problems.append(f"[{section}.remedy].{name}: {problem}")
 
     def link(self, gates: Sequence[Gate]) -> None:
         by_name = {gate.name: gate for gate in gates}

@@ -95,6 +95,10 @@ def test_ssm_references_are_lazy(tmp_path):
         ({"ssm": "not-a-path", "identity": "admin"}, "parameter name"),
         ({"ssm": "/x"}, "needs identity"),
         ({"yaml": "x", "placeholder": "0"}, "placeholder must be a list"),
+        (
+            {"ssm": "/x", "identity": "admin", "placeholder": ["x"]},
+            "placeholders are not supported on ssm references",
+        ),
     ],
 )
 def test_malformed_references(table, message):

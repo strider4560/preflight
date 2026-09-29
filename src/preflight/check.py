@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+)
 
 from preflight.identity import Region
 from preflight.outcome import Outcome
@@ -14,6 +22,30 @@ from preflight.outcome import Outcome
 Name = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$")]
 IdentityRef = Name
 Binds = Literal["section", "identity"]
+T = TypeVar("T")
+
+
+def unique_by(key: Callable[[Any], Hashable]) -> Callable[[list[T]], list[T]]:
+    """A list validator refusing entries whose `key` repeats; the error names the repeated keys."""
+
+    def validate(values: list[T]) -> list[T]:
+        seen: set[Hashable] = set()
+        repeated: list[Hashable] = []
+        for value in values:
+            marker = key(value)
+            if marker in seen and marker not in repeated:
+                repeated.append(marker)
+            seen.add(marker)
+        if repeated:
+            raise ValueError(f"duplicate entries: {', '.join(map(str, repeated))}")
+        return values
+
+    return validate
+
+
+unique = unique_by(lambda value: value)
+# A list whose entries must differ: `UniqueList[str]`.
+UniqueList = Annotated[list[T], AfterValidator(unique)]
 
 
 class Remedy(BaseModel):

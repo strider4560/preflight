@@ -66,6 +66,7 @@ def test_the_worker_environment_drops_credentials_and_tofu_overrides():
         "AWS_PROFILE": "sandbox",
         "AWS_REGION": "us-east-1",
         "AWS_DEFAULT_REGION": "us-east-1",
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
@@ -102,3 +103,10 @@ def test_redirecting_variables_are_dropped_unless_aws_is_kept():
     assert all(kept[name] == value for name, value in REDIRECTS.items())
     assert kept["AWS_CONFIG_FILE"] == "/cfg"
     assert "TF_VAR_x" not in kept
+
+
+@pytest.mark.parametrize("keep_aws", [False, True])
+def test_workers_write_no_bytecode(keep_aws):
+    for identity in (None, Identity(**SPEC)):
+        env = worker_environment({"PATH": "/usr/bin"}, identity, keep_aws=keep_aws, bin_dir="/b")
+        assert env["PYTHONDONTWRITEBYTECODE"] == "1"

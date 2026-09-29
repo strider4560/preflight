@@ -73,8 +73,15 @@ def test_a_syntax_error_names_the_file(repo):
     (gates / "broken.py").write_text("gate = (\n")
     with pytest.raises(GateError) as caught:
         load_gate_file(gates / "broken.py")
-    assert "broken.py" in caught.value.problems[0]
-    assert "SyntaxError" in caught.value.problems[0]
+    assert caught.value.problems == ["broken.py: cannot be loaded (SyntaxError at line 1)"]
+
+
+def test_a_failing_gate_file_reports_only_the_exception_type(repo):
+    gates = consumer(repo, {"a": []})
+    (gates / "leaky.py").write_text("raise RuntimeError('token=hunter2')\n")
+    with pytest.raises(GateError) as caught:
+        load_gate_file(gates / "leaky.py")
+    assert caught.value.problems == ["leaky.py: cannot be loaded (RuntimeError)"]
 
 
 def test_a_gate_named_like_a_stdlib_module_does_not_shadow_it(repo):
@@ -103,8 +110,7 @@ def test_sys_exit_in_a_gate_file_is_a_gate_error(repo):
     (gates / "quits.py").write_text("import sys\nsys.exit(3)\n")
     with pytest.raises(GateError) as caught:
         load_gate_file(gates / "quits.py")
-    assert "quits.py" in caught.value.problems[0]
-    assert "SystemExit" in caught.value.problems[0]
+    assert caught.value.problems == ["quits.py: cannot be loaded (SystemExit)"]
 
 
 @pytest.mark.parametrize(

@@ -102,6 +102,15 @@ def test_an_identity_cannot_use_ssm(repo):
         load_contract(setup(repo, contract=bad))
 
 
+def test_a_placeholder_on_an_ssm_reference_is_refused(repo):
+    bad = CONTRACT.replace('format = "json" }', 'format = "json", placeholder = ["{}"] }')
+    with pytest.raises(ContractError) as caught:
+        load_contract(setup(repo, contract=bad))
+    assert caught.value.problems == [
+        "delegation.name_servers: placeholders are not supported on ssm references"
+    ]
+
+
 def test_a_repository_contract_has_no_environment(repo):
     with pytest.raises(ContractError, match="has no environment"):
         load_contract(

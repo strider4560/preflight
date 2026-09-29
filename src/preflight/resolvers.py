@@ -99,6 +99,8 @@ def parse_reference(table: Mapping[str, Any]) -> Reference | None:
     placeholder = table.get("placeholder", [])
     if not isinstance(placeholder, list):
         raise ResolveError("placeholder must be a list")
+    if source == "ssm" and "placeholder" in table:
+        raise ResolveError("placeholders are not supported on ssm references")
     how = table.get("how")
     if how is not None and not isinstance(how, str):
         raise ResolveError("how must be a string")

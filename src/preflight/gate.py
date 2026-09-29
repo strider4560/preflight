@@ -90,8 +90,13 @@ def load_gate_file(path: Path) -> Gate:
     register_consumer(path.parent.parent)
     try:
         module = importlib.import_module(f"consumer.gates.{path.stem}")
+    except SyntaxError as exc:
+        raise GateError(
+            [f"{path.name}: cannot be loaded (SyntaxError at line {exc.lineno})"]
+        ) from None
     except (Exception, SystemExit) as exc:
-        raise GateError([f"{path.name}: cannot be loaded ({type(exc).__name__}: {exc})"]) from None
+        # Only the type: an exception's message may carry a value the gate file read.
+        raise GateError([f"{path.name}: cannot be loaded ({type(exc).__name__})"]) from None
     gate = getattr(module, "gate", None)
     if not isinstance(gate, Gate):
         raise GateError([f"{path.name}: defines no `gate = Gate(...)`"])

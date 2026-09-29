@@ -1,7 +1,8 @@
 """One check instance in its own process.
 
-`python -m preflight.worker` reads a job as JSON on stdin and writes the outcome as JSON on
-stdout. Nothing else leaves the process: the launcher discards stderr, and kills the whole
+`python -m preflight.worker` reads a job as JSON on stdin and writes the outcome as JSON to a
+private copy of the original stdout, taken before the check runs; the check's own prints go to
+stderr. Nothing else leaves the process: the launcher discards stderr, and kills the whole
 process group when the instance runs out of time."""
 
 from __future__ import annotations
@@ -292,6 +293,7 @@ def launch(
 
 
 def main() -> int:
+    sys.dont_write_bytecode = True  # checks are imported from the consumer's repository
     job = Job.from_json(sys.stdin.read())
     # The result pipe moves to a private, non-inheritable descriptor, so neither the check's
     # prints nor a descendant it leaves behind can touch or hold open the result.

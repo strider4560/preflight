@@ -185,3 +185,9 @@ def test_launch_refuses_after_kill_all_until_reset(repo):
     )
     reset_stop()
     assert launch(job(repo, {"mode": "fail"}), env=env, timeout=60).status is Status.FAIL
+
+
+def test_the_worker_writes_no_bytecode_into_the_consumer(repo):
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    assert launch(job(repo, {}), env=env, timeout=60).status is Status.OK
+    assert list((repo / "preflight").rglob("__pycache__")) == []

@@ -89,4 +89,6 @@ def worker_environment(
         env["AWS_REGION"] = identity.region
         env["AWS_DEFAULT_REGION"] = identity.region
     env["PATH"] = os.pathsep.join(part for part in (bin_dir, env.get("PATH", "")) if part)
+    # Checks are imported from the consumer's repository; leave no bytecode there.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
