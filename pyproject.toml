@@ -1,0 +1,27 @@
+[project]
+name = "iac-preflight"
+version = "0.1.0"
+description = "Modular operational checks before Terraform"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.40,<2",
+  "pydantic>=2.11,<3",
+  "pytest>=8.4,<10",
+  "pytest-html>=4.1,<5",
+  "pytest-testinfra>=10,<11",
+  "pytest-timeout>=2.3,<3",
+]
+[dependency-groups]
+dev = ["ruff>=0.12,<1"]
+[tool.uv]
+package = false
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+markers = ["owner(name): team responsible for a prerequisite"]
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

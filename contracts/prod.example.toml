@@ -1,0 +1,64 @@
+# Copy to prod.local.toml, replace example values, then set example = false.
+# This file cannot run live checks while example is true.
+schema_version = 1
+example = true
+environment = "prod"
+region = "us-east-1"
+modules = ["identity", "state", "network"]
+
+# Named SDK profiles support source_profile, credential_source, SSO and role_arn.
+# Omit profile to use the default SDK credential chain (including CI credentials).
+# Terraform's backend/provider must independently use the same effective roles.
+[identities.deploy]
+profile = "terraform-prod"
+expected_account_id = "111111111111"
+expected_role_arn = "arn:aws:iam::111111111111:role/TerraformDeploy"
+
+[identities.state]
+profile = "terraform-state"
+expected_account_id = "222222222222"
+expected_role_arn = "arn:aws:iam::222222222222:role/TerraformState"
+
+[state]
+identity = "state"
+# inspection_identity = "platform-audit" # define this identity above if needed
+bucket = "replace-with-your-state-bucket"
+owner_account_id = "222222222222"
+region = "us-east-1"
+key = "applications/example/terraform.tfstate"
+workspace = "default"
+mode = "existing" # use "new" only when no state object should exist
+require_versioning = true
+# Omit expected_kms_key_arn to require SSE-S3 (AES256) instead.
+expected_kms_key_arn = "arn:aws:kms:us-east-1:222222222222:key/00000000-0000-0000-0000-000000000000"
+
+[network]
+identity = "deploy"
+vpc_id = "vpc-0123456789abcdef0"
+owner_account_id = "333333333333"
+minimum_azs = 2
+
+[[network.subnets]]
+name = "app-a"
+id = "subnet-0123456789abcdef0"
+az_id = "use1-az1"
+additional_ipv4_required = 40
+reserve_ipv4 = 40
+
+[[network.subnets]]
+name = "app-b"
+id = "subnet-0fedcba9876543210"
+az_id = "use1-az2"
+additional_ipv4_required = 40
+reserve_ipv4 = 40
+
+# To require runtime evidence, add "runtime" to modules and configure these probes.
+# The existing hosts need SSH access, curl, and representative network placement.
+# [[runtime.probes]]
+# name = "app-a"
+# host = "ssh://prod-probe-a"
+# url = "https://bootstrap.internal.example/ready"
+# expected_body = "ready"
+# timeout_seconds = 10
+
+# Free-form settings for your own modules, e.g. [settings.certificates].
