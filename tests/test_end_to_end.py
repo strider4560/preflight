@@ -76,8 +76,15 @@ def test_an_unfinished_repository_names_each_step(repo):
 def test_a_finished_repository_passes_check_status_and_validate(repo):
     setup(repo, "m")
     write(repo, "README.md", "hello\n")
-    assert preflight(repo, *CHECK).returncode == 0
+    check = preflight(repo, *CHECK, "--json", "report.json")
+    assert check.returncode == 0, check.stdout + check.stderr
+    report = json.loads((repo / "report.json").read_text())
+    instances = {i["id"]: i for run in report["runs"] for i in run["instances"]}
+    marker = instances["e2e.marker[marker]"]
+    assert marker["status"] == "ok"
+    assert [item["observed"] for item in marker["items"]] == ["m"]
     status = preflight(repo, "status")
     assert status.returncode == 0, status.stdout + status.stderr
     assert "  satisfied  ready" in status.stdout
     assert preflight(repo, "validate").returncode == 0
+    assert list((repo / "preflight").rglob("__pycache__")) == []
