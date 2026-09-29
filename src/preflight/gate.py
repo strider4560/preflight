@@ -33,6 +33,14 @@ class Gate:
     scope: Literal["environment", "repository"] = "environment"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.requires, (list, tuple)) or not all(
+            isinstance(r, str) and STEM.match(r) for r in self.requires
+        ):
+            raise GateError(
+                [f"gate {self.name}: requires must be a list of gate names (lowercase file stems)"]
+            )
+        if self.guards is not None and not isinstance(self.guards, str):
+            raise GateError([f"gate {self.name}: guards must be a string or None"])
         object.__setattr__(self, "checks", tuple(self.checks))
         object.__setattr__(self, "requires", tuple(self.requires))
         if not self.checks:
@@ -82,7 +90,7 @@ def load_gate_file(path: Path) -> Gate:
     register_consumer(path.parent.parent)
     try:
         module = importlib.import_module(f"consumer.gates.{path.stem}")
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         raise GateError([f"{path.name}: cannot be loaded ({type(exc).__name__}: {exc})"]) from None
     gate = getattr(module, "gate", None)
     if not isinstance(gate, Gate):

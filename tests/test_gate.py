@@ -1,7 +1,20 @@
+import sys
+
 import pytest
 from conftest import write
 
+from preflight import Section, check, ok, outcome
 from preflight.gate import Gate, GateError, load_closure, load_directory, load_gate_file
+
+
+class Local(Section):
+    items: list[str] = []
+
+
+@check("gate_test.local", section=Local)
+def local(ctx, s):
+    return outcome(ok())
+
 
 CHECK = """
 from preflight import Section, check, ok, outcome
@@ -66,7 +79,9 @@ def test_a_syntax_error_names_the_file(repo):
 
 def test_a_gate_named_like_a_stdlib_module_does_not_shadow_it(repo):
     gates = consumer(repo, {"secrets": []})
+    before = list(sys.path)
     load_gate_file(gates / "secrets.py")
+    assert sys.path == before
     import secrets
 
     assert hasattr(secrets, "token_hex")
@@ -81,6 +96,24 @@ def test_load_directory_orders_by_requires_and_skips_private_files(repo):
 def test_a_gate_needs_check_instances():
     with pytest.raises(GateError, match="has no checks"):
         Gate("x", checks=[])
+
+
+def test_sys_exit_in_a_gate_file_is_a_gate_error(repo):
+    gates = consumer(repo, {"a": []})
+    (gates / "quits.py").write_text("import sys\nsys.exit(3)\n")
+    with pytest.raises(GateError) as caught:
+        load_gate_file(gates / "quits.py")
+    assert "quits.py" in caught.value.problems[0]
+    assert "SystemExit" in caught.value.problems[0]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"requires": "abc"}, {"requires": [1]}, {"requires": ["b", 1]}, {"guards": 3}],
+)
+def test_requires_and_guards_are_validated(kwargs):
+    with pytest.raises(GateError):
+        Gate("x", checks=[local("things")], **kwargs)
 
 
 def test_a_bare_check_is_refused(repo):
