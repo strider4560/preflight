@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Annotated, Any, Self
 from urllib.parse import quote
 
@@ -13,29 +14,103 @@ from preflight.outcome import Item, Outcome, error, fail, ok, outcome
 
 Repo = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
 Owner = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+$")]
-SIGN_IN = "Could not query GitHub; check `gh auth status` and sign in if needed."
+Name = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
+EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+$")]
+SEE = ", or check that your gh token can see it."
 
 
 class GhError(Exception):
-    pass
+    kind = "other"
 
 
 class GhNotFound(GhError):
-    pass
+    kind = "notfound"
+
+
+class GhMissing(GhError):
+    kind = "missing"
+
+
+class GhAuth(GhError):
+    kind = "auth"
+
+
+class GhRefused(GhError):
+    kind = "refused"
+
+
+def _classify(rc: int, stderr: str) -> GhError:
+    low = stderr.lower()
+    if rc == 127:
+        return GhMissing("gh not installed")
+    if "http 401" in low or "authentication" in low or "gh auth login" in low:
+        return GhAuth(f"gh api exited {rc}")
+    if "http 403" in low or "http 429" in low or "rate limit" in low:
+        return GhRefused(f"gh api exited {rc}")
+    return GhError(f"gh api exited {rc}")
+
+
+def _gh_api(ctx, command: str, path: str) -> Any:
+    result = ctx.host.run(command, path)
+    if result.rc == 0:
+        text = result.stdout.strip()
+        try:
+            return json.loads(text) if text else None
+        except ValueError as exc:
+            raise GhError("malformed JSON from gh api") from exc
+    if "HTTP 404" in result.stderr:
+        raise GhNotFound(path)
+    raise _classify(result.rc, result.stderr)
 
 
 def gh_api(ctx, path: str) -> Any:
-    result = ctx.host.run("gh api %s", path)
-    if result.rc == 0:
-        text = result.stdout.strip()
-        return json.loads(text) if text else None
-    if "HTTP 404" in result.stderr:
-        raise GhNotFound(path)
-    raise GhError(f"gh api exited {result.rc}")
+    return _gh_api(ctx, "gh api %s", path)
+
+
+def gh_api_pages(ctx, path: str) -> list:
+    """Every page of a list endpoint, as the list of page bodies."""
+    return _list(_gh_api(ctx, "gh api --paginate --slurp %s", path))
+
+
+def _dict(body: Any) -> dict:
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise GhError("unexpected response shape")
+    return body
+
+
+def _list(body: Any) -> list:
+    if body is None:
+        return []
+    if not isinstance(body, list):
+        raise GhError("unexpected response shape")
+    return body
 
 
 def _gh_error(key: str | None, exc: Exception) -> Item:
-    return error(key, do=SIGN_IN, paste="gh auth login", error_type=type(exc).__name__)
+    kind = getattr(exc, "kind", "other")
+    if kind == "missing":
+        return error(key, do="Install the GitHub CLI (gh).", error_type="MissingTool")
+    if kind == "auth":
+        return error(
+            key,
+            do="Sign in to GitHub with the GitHub CLI.",
+            paste="gh auth login",
+            error_type="GhAuth",
+        )
+    if kind == "refused":
+        return error(
+            key,
+            do=(
+                "GitHub refused the request (permissions or rate limit); check your access, "
+                "or retry later."
+            ),
+            error_type="GhRefused",
+        )
+    return error(
+        key, do="Could not reach GitHub; check your network, then rerun.", error_type="GhError"
+    )
 
 
 def _all(items: list[Item]) -> Outcome:
@@ -69,8 +144,8 @@ def repo(ctx, s: RepoSection) -> Outcome:
         return outcome(
             fail(
                 "exists",
-                do=f"Create the repository {s.repo}, or correct its name in the contract.",
-                paste=f"gh repo create {s.repo} --private",
+                do=(f"Create the repository {s.repo}, or correct its name in the contract{SEE}"),
+                paste=f"gh repo create {shlex.quote(s.repo)} --private",
             )
         )
     except GhError as exc:
@@ -78,15 +153,15 @@ def repo(ctx, s: RepoSection) -> Outcome:
     items = [ok("exists")]
     if s.actions_access is not None:
         try:
-            access = (gh_api(ctx, f"repos/{s.repo}/actions/permissions/access") or {}).get(
-                "access_level"
-            )
+            body = gh_api(ctx, f"repos/{s.repo}/actions/permissions/access")
+            access = _dict(body).get("access_level")
         except GhError as exc:
             items.append(_gh_error("actions_access", exc))
         else:
             if access == s.actions_access:
                 items.append(ok("actions_access", observed=access))
             else:
+                endpoint = shlex.quote(f"repos/{s.repo}/actions/permissions/access")
                 items.append(
                     fail(
                         "actions_access",
@@ -95,8 +170,8 @@ def repo(ctx, s: RepoSection) -> Outcome:
                             "(Settings → Actions → General → Access)."
                         ),
                         paste=(
-                            f"gh api -X PUT repos/{s.repo}/actions/permissions/access "
-                            f"-f access_level={s.actions_access}"
+                            f"gh api -X PUT {endpoint} "
+                            f"-f access_level={shlex.quote(s.actions_access)}"
                         ),
                         observed=access,
                     )
@@ -107,7 +182,7 @@ def repo(ctx, s: RepoSection) -> Outcome:
 class VariablesSection(Section):
     repo: Repo | None = None
     org: Owner | None = None
-    variables: dict[str, str]
+    variables: dict[Name, str]
 
     @model_validator(mode="after")
     def one_owner(self) -> Self:
@@ -118,14 +193,15 @@ class VariablesSection(Section):
 
 @check("github.variables", section=VariablesSection)
 def variables(ctx, s: VariablesSection) -> Outcome:
-    base, flag = (
-        (f"orgs/{s.org}", f"--org {s.org}") if s.org else (f"repos/{s.repo}", f"--repo {s.repo}")
-    )
+    if s.org:
+        base, flag = f"orgs/{s.org}", f"--org {shlex.quote(s.org)}"
+    else:
+        base, flag = f"repos/{s.repo}", f"--repo {shlex.quote(s.repo or '')}"
     items = []
     for name, expected in s.variables.items():
-        paste = f"gh variable set {name} {flag} --body '{expected}'"
+        paste = f"gh variable set {shlex.quote(name)} {flag} --body {shlex.quote(expected)}"
         try:
-            value = (gh_api(ctx, f"{base}/actions/variables/{name}") or {}).get("value")
+            value = _dict(gh_api(ctx, f"{base}/actions/variables/{name}")).get("value")
         except GhNotFound:
             items.append(fail(name, do=f"Create the Actions variable {name}.", paste=paste))
             continue
@@ -148,21 +224,22 @@ def variables(ctx, s: VariablesSection) -> Outcome:
 
 class EnvironmentsSection(Section):
     repo: Repo
-    environments: list[str] = Field(min_length=1)
+    environments: list[EnvName] = Field(min_length=1)
 
 
 @check("github.environments", section=EnvironmentsSection)
 def environments(ctx, s: EnvironmentsSection) -> Outcome:
     items = []
     for name in s.environments:
+        endpoint = f"repos/{s.repo}/environments/{quote(name)}"
         try:
-            gh_api(ctx, f"repos/{s.repo}/environments/{quote(name)}")
+            gh_api(ctx, endpoint)
         except GhNotFound:
             items.append(
                 fail(
                     name,
                     do=f"Create the GitHub environment {name} in {s.repo}.",
-                    paste=f"gh api -X PUT repos/{s.repo}/environments/{quote(name)}",
+                    paste=f"gh api -X PUT {shlex.quote(endpoint)}",
                 )
             )
         except GhError as exc:
@@ -183,13 +260,15 @@ class RulesetSection(Section):
 def ruleset(ctx, s: RulesetSection) -> Outcome:
     where = f"Settings → Rules → Rulesets in {s.repo}"
     try:
-        summaries = gh_api(ctx, f"repos/{s.repo}/rulesets") or []
+        summaries = [
+            _dict(r) for page in gh_api_pages(ctx, f"repos/{s.repo}/rulesets") for r in _list(page)
+        ]
         match = next((r for r in summaries if r.get("name") == s.name), None)
         if match is None:
             return outcome(
                 fail("exists", do=f"Create the ruleset {s.name!r} ({where}).", generic=True)
             )
-        detail = gh_api(ctx, f"repos/{s.repo}/rulesets/{match['id']}") or {}
+        detail = _dict(gh_api(ctx, f"repos/{s.repo}/rulesets/{match['id']}"))
     except GhError as exc:
         return outcome(_gh_error("exists", exc))
     items = [ok("exists")]
@@ -205,13 +284,19 @@ def ruleset(ctx, s: RulesetSection) -> Outcome:
             )
         )
     if s.required_checks:
-        contexts = {
-            check_.get("context")
-            for rule in detail.get("rules", [])
-            if rule.get("type") == "required_status_checks"
-            for check_ in (rule.get("parameters") or {}).get("required_status_checks", [])
-            if check_.get("context")
-        }
+        try:
+            contexts = {
+                check_.get("context")
+                for rule in map(_dict, _list(detail.get("rules")))
+                if rule.get("type") == "required_status_checks"
+                for check_ in map(
+                    _dict, _list(_dict(rule.get("parameters")).get("required_status_checks"))
+                )
+                if check_.get("context")
+            }
+        except GhError as exc:
+            items.append(_gh_error("required_checks", exc))
+            return outcome(*items)
         missing = [c for c in s.required_checks if c not in contexts]
         if missing:
             items.append(
@@ -231,21 +316,26 @@ def ruleset(ctx, s: RulesetSection) -> Outcome:
 
 class SecretNamesSection(Section):
     repo: Repo
-    environment: str | None = None
-    names: list[str] = Field(min_length=1)
+    environment: EnvName | None = None
+    names: list[Name] = Field(min_length=1)
 
 
 @check("github.secret_names", section=SecretNamesSection)
 def secret_names(ctx, s: SecretNamesSection) -> Outcome:
     if s.environment:
         path = f"repos/{s.repo}/environments/{quote(s.environment)}/secrets"
-        where, flag = f" on environment {s.environment}", f" --env {s.environment}"
+        where, flag = f" on environment {s.environment}", f" --env {shlex.quote(s.environment)}"
     else:
         path, where, flag = f"repos/{s.repo}/actions/secrets", "", ""
+    ending = "."
     try:
-        present = {x.get("name") for x in (gh_api(ctx, path) or {}).get("secrets", [])}
+        present = {
+            _dict(x).get("name")
+            for page in gh_api_pages(ctx, path)
+            for x in _list(_dict(page).get("secrets"))
+        }
     except GhNotFound:
-        present = set()
+        present, ending = set(), SEE
     except GhError as exc:
         return outcome(_gh_error(None, exc))
     return outcome(
@@ -254,8 +344,8 @@ def secret_names(ctx, s: SecretNamesSection) -> Outcome:
             if name in present
             else fail(
                 name,
-                do=f"Set the secret {name}{where}.",
-                paste=f"gh secret set {name}{flag} --repo {s.repo} < <file holding the value>",
+                do=f"Set the secret {name}{where}{ending}",
+                paste=f"gh secret set {shlex.quote(name)}{flag} --repo {shlex.quote(s.repo)}",
             )
             for name in s.names
         )
@@ -278,14 +368,14 @@ def workflow_green(ctx, s: WorkflowSection) -> Outcome:
         query += f"&event={quote(s.event)}"
     try:
         body = gh_api(ctx, f"repos/{s.repo}/actions/workflows/{quote(s.workflow)}/runs?{query}")
+        runs = _list(_dict(body).get("workflow_runs"))
+        last = _dict(runs[0]) if runs else None
     except GhError as exc:
         return outcome(_gh_error(None, exc))
-    runs = (body or {}).get("workflow_runs", [])
-    if not runs:
+    if last is None:
         return outcome(
             fail(do=f"{s.workflow} has no completed run yet; trigger one.", generic=True)
         )
-    last = runs[0]
     if last.get("conclusion") == "success":
         return outcome(ok(observed=last.get("html_url")))
     return outcome(
