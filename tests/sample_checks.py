@@ -20,3 +20,21 @@ def thing(ctx, s):
 @check("graph.aws_thing", section=AwsThing, requires=[session_for("identity")])
 def aws_thing(ctx, s):
     return outcome(ok())
+
+
+class Sourced(Section):
+    source: IdentityRef
+
+
+@check("graph.sourced", section=Sourced, requires=[session_for("source")])
+def sourced(ctx, s):
+    return outcome(ok())
+
+
+class Identified(Section):
+    identity: IdentityRef
+
+
+@check("graph.identified", section=Identified)
+def identified(ctx, s):
+    return outcome(ok())

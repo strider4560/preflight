@@ -98,8 +98,12 @@ class _Builder:
         return instance_id if scope == self.primary else f"{scope}/{instance_id}"
 
     def _join(self, node_id: str, gate: Gate) -> None:
-        if gate.name not in self.nodes[node_id].gates:
-            self.nodes[node_id].gates.append(gate.name)
+        node = self.nodes[node_id]
+        if gate.name in node.gates:
+            return
+        node.gates.append(gate.name)
+        for dependency in node.requires:
+            self._join(dependency, gate)
 
     def _new(self, node_id: str, **fields: Any) -> Node:
         node = Node(node_id, order=len(self.nodes), **fields)
@@ -146,7 +150,9 @@ class _Builder:
                 for problem in field_problems(check.section, data, skip)
             )
             identity = data.get("identity") if isinstance(data.get("identity"), str) else None
-            if identity is not None and identity not in contract.identity_data:
+            if identity is not None and "identity" in contract.placeholder_fields(instance.key):
+                identity = None
+            elif identity is not None and identity not in contract.identity_data:
                 self.problems.append(
                     f"[{instance.key}].identity: no [identities.{identity}] in {contract.path.name}"
                 )
@@ -165,11 +171,28 @@ class _Builder:
             )
             owner = instance.key
         for requirement in check.requires:
+            required = REGISTRY.get(requirement.check_id)
+            if required is None or required.binds != "identity":
+                self.problems.append(
+                    f"{check.id}: requires unknown identity check {requirement.check_id}"
+                )
+                continue
             alias = node.data.get(requirement.field)
-            if isinstance(alias, str) and alias in contract.identity_data:
-                dependency = self.add(REGISTRY[requirement.check_id](alias), gate)
+            if not isinstance(alias, str):
+                continue
+            if alias in contract.identity_data:
+                dependency = self.add(required(alias), gate)
                 if dependency and dependency not in node.requires:
                     node.requires.append(dependency)
+            elif requirement.field not in contract.placeholder_fields(owner):
+                self.problems.append(
+                    f"[{instance.key}].{requirement.field}: no [identities.{alias}] "
+                    f"in {contract.path.name}"
+                )
+        if node.section_bound and node.identity is not None:
+            dependency = self.add(REGISTRY["aws.session"](node.identity), gate)
+            if dependency and dependency not in node.requires:
+                node.requires.append(dependency)
         for lazy in iter_lazy(node.data):
             dependency = self._ssm_present(lazy, gate)
             if dependency and dependency not in node.requires:
@@ -235,8 +258,10 @@ class _Builder:
                 continue
             try:
                 text.format_map(values)
-            except (KeyError, IndexError, ValueError) as exc:
-                self.problems.append(f"[{section}.remedy].{name}: unknown template field {exc}")
+            except Exception:
+                self.problems.append(
+                    f"[{section}.remedy].{name}: malformed or unknown template field"
+                )
 
     def link(self, gates: Sequence[Gate]) -> None:
         by_name = {gate.name: gate for gate in gates}

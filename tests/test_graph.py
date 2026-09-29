@@ -3,9 +3,11 @@ import pytest
 import sample_checks as sc
 from conftest import write
 
+from preflight import Requirement, check, ok, outcome
+from preflight.check import REGISTRY
 from preflight.contract import load_contract
 from preflight.gate import Gate
-from preflight.graph import GraphError, build_plan
+from preflight.graph import GraphError, _Builder, build_plan
 from preflight.outcome import Status
 
 CONTRACT = """
@@ -80,7 +82,7 @@ def test_missing_sections_and_bad_fields_are_reported_together(repo):
 
 def test_remedy_templates_are_checked(repo):
     text = CONTRACT.replace("{environment}", "{nope}")
-    with pytest.raises(GraphError, match=r"\[dns.remedy\].do: unknown template field 'nope'"):
+    with pytest.raises(GraphError, match=r"\[dns.remedy\].do: malformed or unknown template field"):
         plan([Gate("g", checks=[sc.aws_thing("dns")])], contract(repo, text))
 
 
@@ -130,3 +132,63 @@ def test_repository_nodes_are_prefixed_in_an_environment_plan(repo):
         gates, {"environment": env, "repository": repository}, link_gates=True, strict=False
     )
     assert p.nodes["graph.thing[things]"].requires == ["repository/graph.thing[things]"]
+
+
+def test_joining_a_gate_joins_its_prerequisites(repo):
+    c = contract(repo, account="111111111111")
+    x = Gate("x", checks=[sc.aws_thing("dns")])
+    y = Gate("y", checks=[sc.aws_thing("dns")])
+    z = Gate("z", checks=[REGISTRY["aws.session"]("admin")], requires=["y"])
+    p = plan([x, y, z], c)
+    ids = [n.id for n in p.nodes_of("y")]
+    assert "aws.session[admin]" in ids
+    assert "ssm.present[/platform/dns/name_servers]" in ids
+    assert p.nodes["aws.session[admin]"].gates == ["x", "y", "z"]
+
+
+def test_a_real_prerequisite_cycle_is_reported(repo):
+    c = contract(repo)
+    builder = _Builder({"environment": c})
+    for name, other in (("a", "b"), ("b", "a")):
+        builder._new(
+            name,
+            check_id="x",
+            key=name,
+            gates=["g"],
+            contract=c,
+            data={},
+            identity=None,
+            requires=[other],
+        )
+    builder.topological()
+    assert builder.problems and "prerequisite cycle" in builder.problems[0]
+
+
+@pytest.mark.parametrize("template", ["{environment.nope}", "{environment[x]}", "{"])
+def test_malformed_remedy_templates_are_graph_errors(repo, template):
+    text = CONTRACT.replace("Rerun bootstrap for {environment}.", template)
+    with pytest.raises(GraphError, match="malformed or unknown template field"):
+        plan([Gate("g", checks=[sc.aws_thing("dns")])], contract(repo, text))
+
+
+def test_a_requirement_on_an_unknown_check_is_a_graph_error(repo):
+    @check("graph.badreq", section=sc.Things, requires=[Requirement("nope.check", "identity")])
+    def badreq(ctx, s):
+        return outcome(ok())
+
+    with pytest.raises(GraphError) as caught:
+        plan([Gate("g", checks=[badreq("things")])], contract(repo))
+    assert "graph.badreq: requires unknown identity check nope.check" in caught.value.problems
+
+
+def test_an_unknown_identity_in_a_required_field_is_a_graph_error(repo):
+    text = CONTRACT + '\n[src]\nsource = "ghost"\n'
+    with pytest.raises(GraphError) as caught:
+        plan([Gate("g", checks=[sc.sourced("src")])], contract(repo, text))
+    assert "[src].source: no [identities.ghost] in dev.toml" in caught.value.problems
+
+
+def test_an_identity_field_alone_requires_its_session(repo):
+    text = CONTRACT + '\n[ident]\nidentity = "admin"\n'
+    p = plan([Gate("g", checks=[sc.identified("ident")])], contract(repo, text))
+    assert p.nodes["graph.identified[ident]"].requires == ["aws.session[admin]"]
