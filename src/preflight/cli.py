@@ -64,7 +64,10 @@ def _contracts_for(gates: list[Gate], contract: Contract) -> dict[str, Contract]
         path = contract.path.parent / "repo.toml"
         if not path.is_file():
             raise Invalid([f"gates with repository scope need {path}, which does not exist"])
-        contracts["repository"] = load_contract(path)
+        repository = load_contract(path)
+        if repository.scope != "repository":
+            raise Invalid([f'{path} must have scope = "repository"'])
+        contracts["repository"] = repository
     if "environment" in scopes and "environment" not in contracts:
         raise Invalid(["a repository gate cannot require an environment gate"])
     return contracts
@@ -245,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         print("preflight: interrupted", file=sys.stderr)
         return 130
     except Exception as exc:  # a bug in preflight itself
-        print(f"preflight: internal error ({type(exc).__name__}: {exc})", file=sys.stderr)
+        print(f"preflight: internal error ({type(exc).__name__})", file=sys.stderr)
         return 3
 
 

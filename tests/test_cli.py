@@ -168,3 +168,62 @@ def test_validate(repo, monkeypatch, capsys):
     contract.write_text(contract.read_text().replace("good = true", "good = true\nstray = 1"))
     assert cli.main(["validate"]) == 2
     assert "[flags].stray is used by no check" in capsys.readouterr().err
+
+
+def test_internal_error_does_not_leak_the_message(repo, monkeypatch, capsys):
+    gate_path, contract = consumer(repo)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(cli, "run_plan", boom)
+    assert cli.main(["check", str(gate_path), "--contract", str(contract)]) == 3
+    err = capsys.readouterr().err
+    assert "internal error (RuntimeError)" in err
+    assert "bug" not in err
+
+
+def test_repo_toml_must_have_repository_scope(repo, capsys):
+    _, contract = consumer(repo)
+    gate(repo, "repo_gate", 'flag("flags")', scope="repository")
+    needs = gate(repo, "needs", 'flag("flags")', requires=["repo_gate"])
+    write(repo, "preflight/contracts/repo.toml", DEV.format(good="true"))
+    assert cli.main(["check", str(needs), "--contract", str(contract)]) == 2
+    assert 'must have scope = "repository"' in capsys.readouterr().err
+
+
+def test_validate_never_runs_checks(repo, monkeypatch):
+    consumer(repo)
+    monkeypatch.chdir(repo)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ran")
+
+    monkeypatch.setattr(cli, "run_plan", boom)
+    assert cli.main(["validate"]) == 0
+
+
+def test_exit_2_writes_no_report_files(repo, tmp_path_factory):
+    _, contract = consumer(repo)
+    bad = gate(repo, "bad", 'flag("nope")')
+    out = tmp_path_factory.mktemp("out")
+    code = cli.main(
+        [
+            "check",
+            str(bad),
+            "--contract",
+            str(contract),
+            "--json",
+            str(out / "r.json"),
+            "--junit",
+            str(out / "r.xml"),
+        ]
+    )
+    assert code == 2
+    assert list(out.iterdir()) == []
+
+
+def test_a_missing_contract_is_exit_2(repo, capsys):
+    gate_path, _ = consumer(repo)
+    missing = repo / "preflight" / "contracts" / "nope.toml"
+    assert cli.main(["check", str(gate_path), "--contract", str(missing)]) == 2
