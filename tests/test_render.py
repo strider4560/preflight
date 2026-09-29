@@ -5,7 +5,7 @@ from xml.etree import ElementTree
 
 from preflight.contract import Contract
 from preflight.graph import Node
-from preflight.outcome import Status, error, fail, ok, outcome, pending
+from preflight.outcome import Item, Status, error, fail, ok, outcome, pending
 from preflight.render import (
     instance_json,
     open_steps,
@@ -151,3 +151,48 @@ def test_junit_never_skips():
     assert "skipped" not in text
     vault = suite.find("testcase[@name='dns.cname[aliases]:vault']")
     assert vault.find("system-out").text == "warning: Add CNAME vault.tellabs.dev."
+
+
+def test_json_open_lists_merged_items():
+    results = {
+        "b[x]": result("b[x]", outcome(fail("1", do="Same."), fail("2", do="Same."))),
+    }
+    steps = open_steps(results)
+    report = report_json(
+        command="check",
+        exit_code=1,
+        started="s",
+        finished="f",
+        inputs={},
+        runs=[],
+        steps=steps,
+        inputs_changed=[],
+    )
+    assert report["open"] == ["b[x]:1", "b[x]:2"]
+    assert report["next"] == "b[x]:1"
+
+
+def test_pending_items_with_different_waits_stay_separate():
+    results = {
+        "a[x]": result("a[x]", outcome(pending(wait="an hour"))),
+        "b[x]": result("b[x]", outcome(pending(wait="a day"))),
+    }
+    steps = open_steps(results)
+    assert [s.next_step.wait for s in steps] == ["an hour", "a day"]
+
+
+def test_write_json_tightens_an_existing_file(tmp_path):
+    path = tmp_path / "out.json"
+    path.write_text("old")
+    path.chmod(0o644)
+    write_json(path, {"a": 1})
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_text() == '{\n  "a": 1\n}\n'
+    assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
+
+
+def test_a_failure_without_a_next_step_is_still_open():
+    results = {"k[x]": result("k[x]", outcome(Item("k", Status.FAIL)))}
+    steps = open_steps(results)
+    assert [s.item_id for s in steps] == ["k[x]:k"]
+    assert "No next step was recorded" in render_check("t", results, color=False)

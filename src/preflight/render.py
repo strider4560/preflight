@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,6 +30,7 @@ COLORS = {
     Status.BLOCKED: "90",
 }
 WARN_COLOR = "33"
+NO_NEXT_STEP = "No next step was recorded; see the check's output."
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,10 @@ def item_id(node_id: str, item: Item) -> str:
     return node_id if item.key is None else f"{node_id}:{item.key}"
 
 
+def _step_key(step: OpenStep) -> tuple[str, str | None, str | None, str | None]:
+    return (step.next_step.do, step.next_step.paste, step.next_step.wait, step.next_step.ref)
+
+
 def open_steps(results: Mapping[str, NodeResult]) -> list[OpenStep]:
     unblocks: dict[str, list[str]] = {}
     for result in results.values():
@@ -56,22 +62,23 @@ def open_steps(results: Mapping[str, NodeResult]) -> list[OpenStep]:
         if result.outcome is None:
             continue
         for item in result.outcome.items:
-            if item.advisory or item.status is Status.OK or item.next_step is None:
+            if item.advisory or item.status is Status.OK:
                 continue
+            next_step = item.next_step or NextStep(NO_NEXT_STEP)
             step = OpenStep(
                 item_id(result.node.id, item),
                 result.node.id,
                 item.status,
-                item.next_step,
+                next_step,
                 (),
                 tuple(unblocks.get(result.node.id, ())),
             )
             (settling if item.status is Status.PENDING else urgent).append(step)
     merged: list[OpenStep] = []
     for step in urgent + settling:
-        key = (step.next_step.do, step.next_step.paste)
+        key = _step_key(step)
         for index, existing in enumerate(merged):
-            if (existing.next_step.do, existing.next_step.paste) == key:
+            if _step_key(existing) == key:
                 extra = tuple(u for u in step.unblocks if u not in existing.unblocks)
                 merged[index] = replace(
                     existing,
@@ -206,20 +213,24 @@ def report_json(
         "inputs": [{"path": p, "sha256": h} for p, h in sorted(inputs.items())],
         "inputs_changed": inputs_changed,
         "runs": runs,
-        "open": [step.item_id for step in steps],
+        "open": [i for step in steps for i in (step.item_id, *step.also)],
         "next": steps[0].item_id if steps else None,
     }
 
 
 def write_json(path: Path, data: Any) -> None:
     path = Path(path)
-    temporary = path.with_name(path.name + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        json.dump(data, handle, indent=2, default=str)
-        handle.write("\n")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(data, handle, indent=2, default=str)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
 
 
 def to_junit(name: str, results: Mapping[str, NodeResult]) -> str:
