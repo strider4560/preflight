@@ -1,10 +1,13 @@
 import json
 
+import pytest
 from fakes import IDENTITY, ROLE_ARN, FakeAnsibleHost, FakeHost, FakeResult, make_probe, observe
 from testinfra.modules.ansible import AnsibleException
 
 from preflight.catalog import aws
-from preflight.outcome import Status
+from preflight.outcome import Status, fail, ok, outcome
+from preflight.params import Unmet
+from preflight.runner import StandInExecutor, using
 
 ARGS = {"identity": IDENTITY}
 OTHER_ARN = ROLE_ARN.replace("111111111111", "222222222222")
@@ -172,3 +175,40 @@ def test_region_other_rc_is_an_error_and_other_region_fails(tmp_path):
     item = observe(aws.region(**ARGS), make_probe(tmp_path, host=other)).items[0]
     assert item.status is Status.FAIL
     assert item.next_step.paste == "aws configure set region us-east-1 --profile sandbox"
+
+
+FIELDS = {
+    "profile": "sandbox",
+    "region": "us-east-1",
+    "account_id": "111111111111",
+    "permission_set": "AWSAdministratorAccess",
+}
+
+
+class Answer:
+    def __init__(self, result):
+        self.result, self.ran = result, []
+
+    def run(self, checks):
+        self.ran.extend(c.label for c in checks)
+        return [self.result for _ in checks]
+
+
+def test_signed_in_yields_the_identity_once_the_session_is_ok():
+    executor = Answer(outcome(ok()))
+    with using(executor), aws.signed_in(**FIELDS) as identity:
+        assert identity == IDENTITY
+    assert executor.ran == ["aws.session"]
+
+
+def test_signed_in_raises_unmet_with_the_sessions_steps():
+    step = fail(do="Sign in to profile sandbox.", paste="aws sso login --profile sandbox")
+    with using(Answer(outcome(step))), pytest.raises(Unmet) as exc:
+        with aws.signed_in(**FIELDS):
+            pass
+    assert exc.value.items == (step,)
+
+
+def test_signed_in_under_validate_yields_unverified():
+    with using(StandInExecutor()), aws.signed_in(**FIELDS) as identity:
+        assert identity.profile == "sandbox"

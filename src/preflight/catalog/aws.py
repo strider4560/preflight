@@ -1,16 +1,22 @@
 """AWS sessions: can preflight observe as an identity (`aws.session`), will the caller's next
-command act as it (`aws.assumed`), and is the profile's region the expected one (`aws.region`)."""
+command act as it (`aws.assumed`), is the profile's region the expected one (`aws.region`), and
+`signed_in`, the helper a gate's provider uses to yield a verified identity."""
 
 from __future__ import annotations
 
 import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 from preflight.check import check
 from preflight.identity import Identity
-from preflight.outcome import Outcome, error, fail, ok, outcome
+from preflight.outcome import Outcome, Status, error, fail, ok, outcome
+from preflight.params import Unmet
 from preflight.probe import Probe
+from preflight.runner import probe_now
 
-__all__ = ["Identity", "assumed", "region", "session"]
+__all__ = ["Identity", "assumed", "region", "session", "signed_in"]
 
 CREDENTIAL_VARIABLES = (
     "AWS_ACCESS_KEY_ID",
@@ -166,3 +172,14 @@ def region(probe: Probe, identity: Identity) -> Outcome:
             observed=configured or None,
         )
     )
+
+
+@contextmanager
+def signed_in(**fields: Any) -> Iterator[Identity]:
+    """Yields the identity once its profile signs in as it; otherwise raises Unmet carrying
+    `aws.session`'s next step (for example the `aws sso login` to paste)."""
+    identity = Identity(**fields)
+    result = probe_now(session(identity=identity))
+    if result.status is not Status.OK:
+        raise Unmet(result)
+    yield identity
