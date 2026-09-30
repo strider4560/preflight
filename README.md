@@ -75,6 +75,10 @@ if __name__ == "__main__":
   run the checks defined in it.
 - Import `preflight` before the gate's own modules: it stops Python writing bytecode into the
   repository.
+- Providers and guards run in the caller's working directory, and scripts run a gate by
+  absolute path from anywhere, so a gate that reads its own files resolves them from
+  `Path(__file__)` (for example `ROOT = Path(__file__).resolve().parent.parent`), not from the
+  working directory.
 
 ## Your own checks
 
