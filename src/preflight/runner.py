@@ -1,133 +1,89 @@
-"""Runs a plan: instances in dependency order, at most `jobs` at once. An instance whose
-prerequisite is not ok is blocked and never run."""
+"""Where bound checks run: each in its own worker (a run), nowhere (--validate), or from a
+table of outcomes (tests). `probe_now` runs one check with the current run's executor."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
-import time
-from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
+from typing import Protocol
 
-from preflight.check import REGISTRY
-from preflight.graph import Node, Plan
-from preflight.identity import Identity, worker_environment
-from preflight.outcome import Outcome, Status, apply_remedy, error, outcome
-from preflight.worker import Job, encode_data, kill_all, launch, reset_stop
-
-
-@dataclass
-class NodeResult:
-    node: Node
-    status: Status
-    outcome: Outcome | None
-    blocked_by: list[str]
-    duration: float
+from preflight.check import BoundCheck
+from preflight.identity import worker_environment
+from preflight.outcome import Outcome, ok, outcome
+from preflight.worker import Job, kill_all, launch
 
 
-Launcher = Callable[[Node], Outcome]
+class Executor(Protocol):
+    def run(self, checks: Sequence[BoundCheck]) -> list[Outcome]: ...
 
 
-def _identity(node: Node) -> Identity | None:
-    if node.identity is None:
-        return None
-    identity = node.contract.identity(node.identity)
-    region = node.data.get("region")
-    if isinstance(region, str):
-        identity = identity.model_copy(update={"region": region})
-    return identity
+class WorkerExecutor:
+    """Each check in its own worker process, at most `jobs` at once."""
 
+    def __init__(self, *, root: Path, gate_dir: Path, jobs: int = 4):
+        self.root = root
+        self.gate_dir = gate_dir
+        self.jobs = max(1, jobs)
 
-def job_for(node: Node) -> Job:
-    check = REGISTRY[node.check_id]
-    identity = _identity(node)
-    consumer = sys.modules.get("consumer")
-    consumer_dir = (
-        consumer.__path__[0]
-        if consumer is not None and check.module.startswith("consumer.")
-        else None
-    )
-    return Job(
-        node_id=node.id,
-        check_id=node.check_id,
-        module=check.module,
-        consumer_dir=consumer_dir,
-        root=str(node.contract.root),
-        environment=node.contract.environment,
-        data=encode_data(node.data),
-        identity=identity.model_dump() if identity else None,
-        identities={a: i.model_dump() for a, i in node.contract.ready_identities().items()},
-    )
+    def job(self, bound: BoundCheck) -> Job:
+        check = bound.check
+        return Job(
+            label=bound.label,
+            module=check.module,
+            file=check.file,
+            name=check.name,
+            gate_dir=str(self.gate_dir),
+            root=str(self.root),
+            arguments=bound.arguments_json(),
+        )
 
-
-def default_launcher(node: Node) -> Outcome:
-    try:
-        check = REGISTRY[node.check_id]
+    def _one(self, bound: BoundCheck) -> Outcome:
         env = worker_environment(
             os.environ,
-            _identity(node),
-            keep_aws=check.ambient,
+            bound.identity,
+            keep_aws=bound.check.ambient,
             bin_dir=str(Path(sys.executable).parent),
         )
-        job = job_for(node)
-    except Exception as exc:
-        name = type(exc).__name__
-        return outcome(
-            error(do=f"Preflight could not prepare {node.check_id} ({name}).", error_type=name)
-        )
-    return launch(job, env=env, timeout=node.timeout)
+        return launch(self.job(bound), env=env, timeout=bound.timeout)
 
-
-def _timed(launcher: Launcher, node: Node) -> tuple[Outcome, float]:
-    start = time.monotonic()
-    result = launcher(node)
-    return result, time.monotonic() - start
-
-
-def _finish(node: Node, result: Outcome, duration: float) -> NodeResult:
-    merged = apply_remedy(result, node.remedy(), node.template_values())
-    return NodeResult(node, merged.status, merged, [], duration)
-
-
-def run_plan(
-    plan: Plan, *, jobs: int = 4, launcher: Launcher = default_launcher
-) -> dict[str, NodeResult]:
-    reset_stop()
-    order = plan.ordered()
-    results: dict[str, NodeResult] = {}
-    waiting = list(order)
-    running: dict[Future, Node] = {}
-    jobs = max(1, jobs)
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    def run(self, checks: Sequence[BoundCheck]) -> list[Outcome]:
+        pool = ThreadPoolExecutor(max_workers=self.jobs)
         try:
-            while waiting or running:
-                progressed = False
-                for node in list(waiting):
-                    if any(dep not in results for dep in node.requires):
-                        continue
-                    not_ok = [d for d in node.requires if results[d].status is not Status.OK]
-                    if not_ok:
-                        results[node.id] = NodeResult(node, Status.BLOCKED, None, not_ok, 0.0)
-                    elif node.static is not None:
-                        results[node.id] = _finish(node, node.static, 0.0)
-                    elif len(running) < jobs:
-                        running[pool.submit(_timed, launcher, node)] = node
-                    else:
-                        continue
-                    waiting.remove(node)
-                    progressed = True
-                if running:
-                    done, _ = wait(running, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        node = running.pop(future)
-                        result, duration = future.result()
-                        results[node.id] = _finish(node, result, duration)
-                elif not progressed:
-                    raise RuntimeError("some instances wait on prerequisites that never finish")
+            return list(pool.map(self._one, checks))
         except BaseException:
             kill_all()
-            pool.shutdown(wait=False, cancel_futures=True)
             raise
-    return {node.id: results[node.id] for node in order}
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+class StandInExecutor:
+    """For --validate: nothing is observed and no worker starts; every check stands in as ok."""
+
+    def run(self, checks: Sequence[BoundCheck]) -> list[Outcome]:
+        return [outcome(ok(observed="not observed (--validate)")) for _ in checks]
+
+
+_CURRENT: ContextVar[Executor | None] = ContextVar("preflight_executor", default=None)
+
+
+@contextlib.contextmanager
+def using(executor: Executor) -> Iterator[None]:
+    token = _CURRENT.set(executor)
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)
+
+
+def probe_now(bound: BoundCheck) -> Outcome:
+    """Runs one check now, in a worker during a run: for providers that must observe."""
+    executor = _CURRENT.get()
+    if executor is None:
+        raise RuntimeError("probe_now runs only while a gate runs")
+    return executor.run([bound])[0]

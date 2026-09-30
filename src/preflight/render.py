@@ -1,303 +1,120 @@
-"""The worklist in the terminal, and the same results as JSON and JUnit."""
+"""The worklist: which guards passed, where the run stopped, and what to do next."""
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any
-from xml.etree import ElementTree
+from dataclasses import dataclass
 
-import preflight
-from preflight.outcome import Item, NextStep, Status
-from preflight.runner import NodeResult
+from preflight.outcome import Item, NextStep, Outcome, Status
 
-LABELS = {
-    Status.OK: "ok",
-    Status.FAIL: "FAIL",
-    Status.PENDING: "pending",
-    Status.ERROR: "ERROR",
-    Status.BLOCKED: "blocked",
-}
-COLORS = {
-    Status.OK: "32",
-    Status.FAIL: "31",
-    Status.PENDING: "33",
-    Status.ERROR: "31",
-    Status.BLOCKED: "90",
-}
-WARN_COLOR = "33"
-NO_NEXT_STEP = "No next step was recorded; see the check's output."
+LABELS = {Status.FAIL: "FAIL", Status.ERROR: "ERROR", Status.PENDING: "pending", Status.OK: "ok"}
+NO_NEXT_STEP = NextStep("No next step was recorded; rerun, and report it if it persists.")
+DETAIL = " " * 6
+STEP = " " * 14
 
 
 @dataclass(frozen=True)
-class OpenStep:
-    item_id: str
-    node_id: str
-    status: Status
-    next_step: NextStep
-    also: tuple[str, ...] = ()
-    unblocks: tuple[str, ...] = ()
+class CheckResult:
+    label: str
+    outcome: Outcome
 
 
-def item_id(node_id: str, item: Item) -> str:
-    return node_id if item.key is None else f"{node_id}:{item.key}"
+@dataclass(frozen=True)
+class GuardResult:
+    name: str
+    checks: tuple[CheckResult, ...] = ()
+    unmet: tuple[Item, ...] = ()
+    unmet_by: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return not self.unmet and all(c.outcome.status is Status.OK for c in self.checks)
+
+    def labelled_items(self) -> list[tuple[str, Item]]:
+        pairs = [(f"needs {self.unmet_by}", item) for item in self.unmet]
+        for result in self.checks:
+            pairs.extend((result.label, item) for item in result.outcome.items)
+        return [
+            (label if item.key is None else f"{label}:{item.key}", item) for label, item in pairs
+        ]
 
 
-def _step_key(step: OpenStep) -> tuple[str, str | None, str | None, str | None]:
-    return (step.next_step.do, step.next_step.paste, step.next_step.wait, step.next_step.ref)
+@dataclass(frozen=True)
+class RunResult:
+    gate: str
+    arguments: tuple[str, ...] = ()
+    exit_code: int = 0
+    guards: tuple[GuardResult, ...] = ()
+    not_run: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+    validated: bool = False
+    output: str = ""
+
+    @property
+    def stopped_at(self) -> str | None:
+        return next((guard.name for guard in self.guards if not guard.passed), None)
 
 
-def open_steps(results: Mapping[str, NodeResult]) -> list[OpenStep]:
-    unblocks: dict[str, list[str]] = {}
-    for result in results.values():
-        for dependency in result.blocked_by:
-            unblocks.setdefault(dependency, []).append(result.node.id)
-    urgent: list[OpenStep] = []
-    settling: list[OpenStep] = []
-    for result in results.values():
-        if result.outcome is None:
+def _step_lines(step: NextStep) -> list[str]:
+    lines = [STEP + line for line in step.do.splitlines()]
+    if step.paste:
+        lines.extend(STEP + "  " + line for line in step.paste.splitlines())
+    if step.wait:
+        lines.append(STEP + "wait: " + step.wait)
+    if step.ref:
+        lines.append(STEP + "see: " + step.ref)
+    return lines
+
+
+def _open(guard: GuardResult) -> list[str]:
+    groups: dict[tuple[Status, NextStep], list[tuple[str, Item]]] = {}
+    for label, item in guard.labelled_items():
+        if item.status is Status.OK or item.advisory:
             continue
-        for item in result.outcome.items:
-            if item.advisory or item.status is Status.OK:
-                continue
-            next_step = item.next_step or NextStep(NO_NEXT_STEP)
-            step = OpenStep(
-                item_id(result.node.id, item),
-                result.node.id,
-                item.status,
-                next_step,
-                (),
-                tuple(unblocks.get(result.node.id, ())),
-            )
-            (settling if item.status is Status.PENDING else urgent).append(step)
-    merged: list[OpenStep] = []
-    for step in urgent + settling:
-        key = _step_key(step)
-        for index, existing in enumerate(merged):
-            if _step_key(existing) == key:
-                extra = tuple(u for u in step.unblocks if u not in existing.unblocks)
-                merged[index] = replace(
-                    existing,
-                    also=existing.also + (step.item_id,),
-                    unblocks=existing.unblocks + extra,
-                )
-                break
-        else:
-            merged.append(step)
-    return merged
+        groups.setdefault((item.status, item.next_step or NO_NEXT_STEP), []).append((label, item))
+    lines: list[str] = []
+    for (status, step), members in groups.items():
+        labels = ", ".join(label for label, _ in members)
+        error_type = members[0][1].error_type if status is Status.ERROR else None
+        suffix = f" ({error_type})" if error_type else ""
+        lines.append(f"{DETAIL}{LABELS[status]:<7} {labels}{suffix}")
+        lines.extend(_step_lines(step))
+    lines.extend(
+        f"{DETAIL}{'ok':<7} {label}"
+        for label, item in guard.labelled_items()
+        if item.status is Status.OK and not item.advisory
+    )
+    return lines
 
 
-def warnings(results: Mapping[str, NodeResult]) -> list[tuple[str, NextStep | None]]:
+def _warnings(result: RunResult) -> list[str]:
     return [
-        (item_id(result.node.id, item), item.next_step)
-        for result in results.values()
-        if result.outcome is not None
-        for item in result.outcome.items
+        f"  ! {label}  {(item.next_step or NO_NEXT_STEP).do}"
+        for guard in result.guards
+        for label, item in guard.labelled_items()
         if item.advisory and item.status is not Status.OK
     ]
 
 
-def _label(status: Status, *, advisory: bool, color: bool) -> str:
-    padded = f"{'warn' if advisory else LABELS[status]:<8}"
-    if not color:
-        return padded
-    return f"\033[{WARN_COLOR if advisory else COLORS[status]}m{padded}\033[0m"
-
-
-def render_results(results: Mapping[str, NodeResult], *, color: bool) -> list[str]:
-    lines = []
-    for result in results.values():
-        if result.outcome is None:
-            waits = ", ".join(result.blocked_by)
-            label = _label(Status.BLOCKED, advisory=False, color=color)
-            lines.append(f"  {label} {result.node.id}  (waits on: {waits})")
-            continue
-        for item in result.outcome.items:
-            advisory = item.advisory and item.status is not Status.OK
-            label = _label(item.status, advisory=advisory, color=color)
-            lines.append(f"  {label} {item_id(result.node.id, item)}")
-    return lines
-
-
-def render_steps(steps: Sequence[OpenStep], *, first_is_next: bool = True) -> list[str]:
-    lines = []
-    for number, step in enumerate(steps, 1):
-        marker = "> NEXT" if first_is_next and number == 1 else f"  {number}."
-        also = f" (also {', '.join(step.also)})" if step.also else ""
-        lines.append(f"{marker:<7} {step.item_id}{also}")
-        lines.append(f"        {step.next_step.do}")
-        if step.next_step.paste:
-            lines.extend(f"          {line}" for line in step.next_step.paste.splitlines())
-        if step.next_step.wait:
-            lines.append(f"        wait: {step.next_step.wait}")
-        if step.next_step.ref:
-            lines.append(f"        see: {step.next_step.ref}")
-        if step.unblocks:
-            lines.append(f"        then unblocks: {', '.join(step.unblocks)}")
-    return lines
-
-
-def render_check(title: str, results: Mapping[str, NodeResult], *, color: bool) -> str:
-    steps = open_steps(results)
-    lines = [title, "", *render_results(results, color=color), ""]
-    lines += ["Open steps:", *render_steps(steps)] if steps else ["Nothing open."]
-    warned = warnings(results)
-    if warned:
-        lines += ["", "Warnings:"]
-        lines += [f"  {ident}: {step.do if step else 'see the check'}" for ident, step in warned]
-    return "\n".join(lines) + "\n"
-
-
-def _item_json(node_id: str, item: Item) -> dict[str, Any]:
-    step = item.next_step
-    return {
-        "id": item_id(node_id, item),
-        "status": item.status.value,
-        "advisory": item.advisory,
-        "observed": item.observed,
-        "next_step": (
-            {"do": step.do, "paste": step.paste, "wait": step.wait, "ref": step.ref}
-            if step
-            else None
-        ),
-    }
-
-
-def instance_json(result: NodeResult) -> dict[str, Any]:
-    node = result.node
-    items = result.outcome.items if result.outcome else ()
-    return {
-        "id": node.id,
-        "check": node.check_id,
-        "section": node.key if node.section_bound else None,
-        "gate": node.owner,
-        "status": result.status.value,
-        "requires": list(node.requires),
-        "blocked_by": list(result.blocked_by),
-        "duration_s": round(result.duration, 3),
-        "error_type": next((i.error_type for i in items if i.error_type), None),
-        "items": [_item_json(node.id, item) for item in items],
-    }
-
-
-def run_json(gate: str, environment: str | None, results: Sequence[NodeResult]) -> dict[str, Any]:
-    return {
-        "gate": gate,
-        "environment": environment,
-        "instances": [instance_json(r) for r in results],
-    }
-
-
-def report_json(
-    *,
-    command: str,
-    exit_code: int,
-    started: str,
-    finished: str,
-    inputs: Mapping[str, str],
-    runs: list[dict[str, Any]],
-    steps: Sequence[OpenStep],
-    inputs_changed: list[str],
-) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "preflight_version": preflight.__version__,
-        "command": command,
-        "exit_code": exit_code,
-        "started_at": started,
-        "finished_at": finished,
-        "inputs": [{"path": p, "sha256": h} for p, h in sorted(inputs.items())],
-        "inputs_changed": inputs_changed,
-        "runs": runs,
-        "open": [i for step in steps for i in (step.item_id, *step.also)],
-        "next": steps[0].item_id if steps else None,
-    }
-
-
-def write_text(path: Path, text: str) -> None:
-    """Replaces `path` atomically with `text` (UTF-8), readable by the owner only."""
-    path = Path(path)
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-    except BaseException:
-        Path(name).unlink(missing_ok=True)
-        raise
-
-
-def write_json(path: Path, data: Any) -> None:
-    write_text(path, json.dumps(data, indent=2, default=str) + "\n")
-
-
-def to_junit(name: str, results: Mapping[str, NodeResult]) -> str:
-    suite = ElementTree.Element("testsuite", name=name)
-    tests = failures = errors = 0
-    for result in results.values():
-        entries: list[tuple[str, Item | None]] = (
-            [(result.node.id, None)]
-            if result.outcome is None
-            else [(item_id(result.node.id, i), i) for i in result.outcome.items]
-        )
-        for ident, item in entries:
-            tests += 1
-            case = ElementTree.SubElement(
-                suite, "testcase", classname=result.node.check_id, name=ident
-            )
-            if item is None:
-                failures += 1
-                ElementTree.SubElement(
-                    case,
-                    "failure",
-                    type="blocked",
-                    message=f"waits on {', '.join(result.blocked_by)}",
-                )
-                continue
-            message = item.next_step.do if item.next_step else item.status.value
-            if item.status is Status.OK:
-                continue
-            if item.advisory:
-                ElementTree.SubElement(case, "system-out").text = f"warning: {message}"
-            elif item.status is Status.ERROR:
-                errors += 1
-                ElementTree.SubElement(
-                    case, "error", type=item.error_type or "error", message=message
-                )
-            else:
-                failures += 1
-                ElementTree.SubElement(case, "failure", type=item.status.value, message=message)
-    suite.set("tests", str(tests))
-    suite.set("failures", str(failures))
-    suite.set("errors", str(errors))
-    return ElementTree.tostring(suite, encoding="unicode", xml_declaration=True) + "\n"
-
-
-def render_status(
-    sections: Sequence[tuple[str, Sequence[tuple[str, str, Sequence[str]]]]],
-    main_steps: Sequence[OpenStep],
-    also_steps: Sequence[OpenStep],
-) -> str:
-    lines = ["preflight status"]
-    for label, rows in sections:
-        lines += ["", label]
-        for state, name, waits in rows:
-            suffix = f"  (waits on {', '.join(waits)})" if waits else ""
-            lines.append(f"  {state:<10} {name}{suffix}")
+def worklist(result: RunResult) -> str:
+    lines = [" ".join(["preflight", result.gate, *result.arguments]), ""]
+    for guard in result.guards:
+        lines.append(f"  {'✓' if guard.passed else '✗'} {guard.name}")
+        if not guard.passed:
+            lines.extend(_open(guard))
+    warnings = _warnings(result)
+    if warnings:
+        lines += ["", "Warnings:", *warnings]
     lines.append("")
-    if main_steps:
-        lines += ["Open steps:", *render_steps(main_steps)]
-    elif also_steps:
-        lines.append("Nothing open outside gates still waiting.")
-    else:
-        lines.append("Nothing open.")
-    if also_steps:
-        lines += ["", "Also open, in gates still waiting:"]
-        lines += render_steps(also_steps, first_is_next=False)
+    if result.problems:
+        lines += ["Problems:", *(f"  - {problem}" for problem in result.problems)]
+    if result.stopped_at:
+        lines.append(f"Stopped at: {result.stopped_at}")
+    if result.not_run:
+        lines.append("Not run: " + ", ".join(result.not_run))
+    if result.exit_code == 0:
+        lines.append(
+            "Validated every guard; nothing was observed."
+            if result.validated
+            else "Every guard passed."
+        )
     return "\n".join(lines) + "\n"

@@ -1,147 +1,104 @@
-import threading
+import importlib
+import sys
 import time
-from pathlib import Path
 
 import pytest
+from conftest import write
+from fakes import IDENTITY
 
 from preflight import runner
-from preflight.contract import Contract
-from preflight.graph import Node, Plan
-from preflight.outcome import Status, fail, ok, outcome
+from preflight.outcome import Status
+from preflight.runner import StandInExecutor, WorkerExecutor, probe_now, using
+
+CHECKS = """
+import os
+import time
+
+from preflight.check import check
+from preflight.identity import Identity
+from preflight.outcome import fail, ok, outcome
 
 
-def contract(sections=None):
-    return Contract(
-        path=Path("dev.toml"),
-        root=Path("/tmp"),
-        scope="environment",
-        environment="dev",
-        identity_data={},
-        sections=sections or {},
-        placeholders=[],
-        inputs={},
+@check(key="name")
+def sample(probe, name: str, mode: str = "ok"):
+    if mode == "sleep":
+        time.sleep(2)
+    return outcome(fail(do=f"Fix {name}.") if mode == "fail" else ok(observed=name))
+
+
+@check
+def environment(probe, identity: Identity):
+    keys = ("AWS_PROFILE", "AWS_REGION", "AWS_ACCESS_KEY_ID")
+    return outcome(ok(observed={k: os.environ.get(k) for k in keys}))
+
+
+@check(ambient=True)
+def ambient_environment(probe, identity: Identity):
+    return outcome(ok(observed=os.environ.get("AWS_PROFILE")))
+"""
+
+
+@pytest.fixture
+def checks(repo, monkeypatch):
+    write(repo, "gate/runnerchecks.py", CHECKS)
+    monkeypatch.syspath_prepend(str(repo / "gate"))
+    module = importlib.import_module("runnerchecks")
+    yield module
+    sys.modules.pop("runnerchecks", None)
+
+
+def executor(repo, jobs=4):
+    return WorkerExecutor(root=repo, gate_dir=repo / "gate", jobs=jobs)
+
+
+def test_checks_run_in_parallel_workers_and_keep_their_order(repo, checks):
+    bound = [checks.sample(name=n, mode="sleep") for n in ("a", "b", "c")]
+    started = time.monotonic()
+    results = executor(repo).run(bound)
+    assert time.monotonic() - started < 5
+    assert [r.items[0].observed for r in results] == ["a", "b", "c"]
+
+
+def test_the_job_names_the_module_and_the_arguments(repo, checks):
+    job = executor(repo).job(checks.sample(name="x"))
+    assert (job.label, job.module, job.name) == ("runnerchecks.sample(x)", "runnerchecks", "sample")
+    assert job.gate_dir == str(repo / "gate") and job.root == str(repo)
+    assert job.arguments == '{"name":"x","mode":"ok"}'
+
+
+def test_an_identity_argument_sets_the_workers_profile_and_region(repo, checks, monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIASTRAY")
+    (result,) = executor(repo).run([checks.environment(identity=IDENTITY)])
+    assert result.items[0].observed == {
+        "AWS_PROFILE": "sandbox",
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": None,
+    }
+
+
+def test_an_ambient_check_keeps_the_callers_profile(repo, checks, monkeypatch):
+    monkeypatch.setenv("AWS_PROFILE", "elsewhere")
+    ambient, cleaned = executor(repo).run(
+        [checks.ambient_environment(identity=IDENTITY), checks.environment(identity=IDENTITY)]
     )
+    assert ambient.items[0].observed == "elsewhere"
+    assert cleaned.items[0].observed["AWS_PROFILE"] == "sandbox"
 
 
-CONTRACT = contract()
+def test_stand_ins_observe_nothing(repo, checks, monkeypatch):
+    def no_launch(*args, **kwargs):
+        raise AssertionError("a worker was launched")
+
+    monkeypatch.setattr(runner, "launch", no_launch)
+    (result,) = StandInExecutor().run([checks.sample(name="x", mode="fail")])
+    assert result.status is Status.OK
+    assert result.items[0].observed == "not observed (--validate)"
 
 
-def node(node_id, *requires, static=None, bound=False, c=CONTRACT, data=None):
-    return Node(
-        id=node_id,
-        check_id="graph.thing",
-        key=node_id,
-        gates=["g"],
-        contract=c,
-        data=data or {},
-        identity=None,
-        requires=list(requires),
-        static=static,
-        section_bound=bound,
-    )
-
-
-def plan(*nodes):
-    return Plan({n.id: n for n in nodes}, [], {"environment": CONTRACT})
-
-
-def scripted(outcomes):
-    calls = []
-
-    def launch(n):
-        calls.append(n.id)
-        return outcomes[n.id]
-
-    launch.calls = calls
-    return launch
-
-
-def test_dependents_of_a_failure_are_blocked_and_not_run():
-    launch = scripted({"a": outcome(fail(do="x")), "b": outcome(ok()), "c": outcome(ok())})
-    results = runner.run_plan(plan(node("a"), node("b", "a"), node("c", "b")), launcher=launch)
-    assert [r.status for r in results.values()] == [Status.FAIL, Status.BLOCKED, Status.BLOCKED]
-    assert results["b"].blocked_by == ["a"]
-    assert results["c"].blocked_by == ["b"]
-    assert launch.calls == ["a"]
-
-
-def test_an_advisory_failure_does_not_block():
-    launch = scripted({"a": outcome(fail("w", do="x", advisory=True)), "b": outcome(ok())})
-    results = runner.run_plan(plan(node("a"), node("b", "a")), launcher=launch)
-    assert results["b"].status is Status.OK
-
-
-def test_static_outcomes_are_not_launched():
-    launch = scripted({})
-    results = runner.run_plan(
-        plan(node("p", static=outcome(fail(do="Fill it."))), node("b", "p")), launcher=launch
-    )
-    assert [r.status for r in results.values()] == [Status.FAIL, Status.BLOCKED]
-    assert launch.calls == []
-
-
-def test_the_sections_remedy_is_applied():
-    c = contract({"s": {"remedy": {"do": "Rerun for {environment}."}}})
-    launch = scripted({"s": outcome(fail(do="generic", generic=True))})
-    n = node("s", bound=True, c=c, data=c.sections["s"])
-    result = runner.run_plan(Plan({"s": n}, [], {"environment": c}), launcher=launch)["s"]
-    assert result.outcome.items[0].next_step.do == "Rerun for dev."
-
-
-def test_no_more_than_jobs_run_at_once():
-    active = 0
-    peak = 0
-    lock = threading.Lock()
-
-    def launch(n):
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        time.sleep(0.05)
-        with lock:
-            active -= 1
-        return outcome(ok())
-
-    runner.run_plan(plan(*[node(f"n{i}") for i in range(6)]), jobs=2, launcher=launch)
-    assert peak == 2
-
-
-def test_an_interrupt_kills_the_workers(monkeypatch):
-    killed = []
-    monkeypatch.setattr(runner, "kill_all", lambda: killed.append(True))
-
-    def launch(n):
-        raise KeyboardInterrupt
-
-    with pytest.raises(KeyboardInterrupt):
-        runner.run_plan(plan(node("a")), launcher=launch)
-    assert killed == [True]
-
-
-def test_any_launcher_exception_kills_the_workers(monkeypatch):
-    killed = []
-    monkeypatch.setattr(runner, "kill_all", lambda: killed.append(True))
-
-    def launch(n):
-        raise RuntimeError("boom")
-
-    with pytest.raises(RuntimeError):
-        runner.run_plan(plan(node("a")), launcher=launch)
-    assert killed == [True]
-
-
-def test_run_plan_resets_the_stop_flag_first(monkeypatch):
-    calls = []
-    monkeypatch.setattr(runner, "reset_stop", lambda: calls.append(True))
-    runner.run_plan(plan(node("a")), launcher=scripted({"a": outcome(ok())}))
-    assert calls == [True]
-
-
-def test_a_job_that_cannot_be_built_is_an_error_outcome():
-    identity = {"profile": "p", "region": "us-east-1", "account_id": "<FILL>", "role": "r"}
-    c = contract()
-    c.identity_data = {"admin": identity}
-    n = node("a", c=c)
-    n.identity = "admin"
-    assert runner.default_launcher(n).status is Status.ERROR
+def test_probe_now_runs_only_inside_a_run(repo, checks):
+    with pytest.raises(RuntimeError, match="only while a gate runs"):
+        probe_now(checks.sample(name="x"))
+    with using(StandInExecutor()):
+        assert probe_now(checks.sample(name="x")).status is Status.OK
+    with using(executor(repo)):
+        assert probe_now(checks.sample(name="x", mode="fail")).status is Status.FAIL

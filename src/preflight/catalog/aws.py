@@ -1,14 +1,22 @@
 """AWS sessions: can preflight observe as an identity (`aws.session`), will the caller's next
-command act as it (`aws.assumed`), and is the profile's region the expected one (`aws.region`)."""
+command act as it (`aws.assumed`), is the profile's region the expected one (`aws.region`), and
+`signed_in`, the helper a gate's provider uses to yield a verified identity."""
 
 from __future__ import annotations
 
 import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
-from preflight.check import IdentitySection, check, session_for
-from preflight.outcome import Outcome, error, fail, ok, outcome
+from preflight.check import check
+from preflight.identity import Identity
+from preflight.outcome import Outcome, Status, error, fail, ok, outcome
+from preflight.params import Unmet
+from preflight.probe import Probe
+from preflight.runner import probe_now
 
-__all__ = ["assumed", "region", "session", "session_for"]
+__all__ = ["Identity", "assumed", "region", "session", "signed_in"]
 
 CREDENTIAL_VARIABLES = (
     "AWS_ACCESS_KEY_ID",
@@ -29,30 +37,29 @@ PROFILE_OVERRIDES = (
 )
 
 
-def _caller(ctx, *, ambient: bool) -> tuple[str, str]:
-    info = ctx.aws_module(
+def _caller(probe: Probe, *, ambient: bool) -> tuple[str, str]:
+    info = probe.aws_module(
         "amazon.aws.aws_caller_info", {}, ambient=ambient, expect=("account", "arn")
     )
     return str(info.get("account", "")), str(info.get("arn", ""))
 
 
-def _profile_missing(ctx, profile: str) -> bool:
+def _profile_missing(probe: Probe, profile: str) -> bool:
     """True only when the CLI lists profiles and this one is not among them."""
-    listing = ctx.host.run("aws configure list-profiles")
+    listing = probe.host.run("aws configure list-profiles")
     if listing.rc != 0:
         return False
     return profile not in [line.strip() for line in listing.stdout.splitlines()]
 
 
-@check("aws.session", binds="identity")
-def session(ctx, s: IdentitySection) -> Outcome:
-    identity = ctx.identity
+@check
+def session(probe: Probe, identity: Identity) -> Outcome:
     profile = identity.profile
     login = f"aws sso login --profile {shlex.quote(profile)}"
     try:
-        account, arn = _caller(ctx, ambient=False)
+        account, arn = _caller(probe, ambient=False)
     except Exception as exc:
-        if _profile_missing(ctx, profile):
+        if _profile_missing(probe, profile):
             return outcome(
                 error(
                     do=f"Profile {profile} is not configured; add it to ~/.aws/config.",
@@ -74,7 +81,7 @@ def session(ctx, s: IdentitySection) -> Outcome:
         fail(
             do=(
                 f"Profile {identity.profile} signs in as {arn or 'nothing'} in account "
-                f"{account or 'unknown'}, but this contract expects {identity.describe()}. "
+                f"{account or 'unknown'}, but this gate expects {identity.describe()}. "
                 "Point the profile at that account and permission set in ~/.aws/config, "
                 "then sign in again."
             ),
@@ -95,13 +102,12 @@ def _environment_fix(environ, identity) -> str:
     return "\n".join(lines)
 
 
-@check("aws.assumed", binds="identity", ambient=True)
-def assumed(ctx, s: IdentitySection) -> Outcome:
-    identity = ctx.identity
-    fix = _environment_fix(ctx.environ, identity)
+@check(ambient=True)
+def assumed(probe: Probe, identity: Identity) -> Outcome:
+    fix = _environment_fix(probe.environ, identity)
     login = f"aws sso login --profile {identity.profile}"
     try:
-        account, arn = _caller(ctx, ambient=True)
+        account, arn = _caller(probe, ambient=True)
     except Exception as exc:
         return outcome(
             error(
@@ -140,10 +146,9 @@ def assumed(ctx, s: IdentitySection) -> Outcome:
     )
 
 
-@check("aws.region", binds="identity")
-def region(ctx, s: IdentitySection) -> Outcome:
-    identity = ctx.identity
-    result = ctx.host.run("aws configure get region --profile %s", identity.profile)
+@check
+def region(probe: Probe, identity: Identity) -> Outcome:
+    result = probe.host.run("aws configure get region --profile %s", identity.profile)
     if result.rc == 127:
         return outcome(error(do="Install the AWS CLI.", error_type="MissingTool"))
     if result.rc not in (0, 1):
@@ -167,3 +172,14 @@ def region(ctx, s: IdentitySection) -> Outcome:
             observed=configured or None,
         )
     )
+
+
+@contextmanager
+def signed_in(**fields: Any) -> Iterator[Identity]:
+    """Yields the identity once its profile signs in as it; otherwise raises Unmet carrying
+    `aws.session`'s next step (for example the `aws sso login` to paste)."""
+    identity = Identity(**fields)
+    result = probe_now(session(identity=identity))
+    if result.status is not Status.OK:
+        raise Unmet(result)
+    yield identity

@@ -7,9 +7,10 @@ from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
-from preflight.check import Section, check, unique_by
+from preflight.check import check, unique_by
 from preflight.dnsclient import DnsUnavailable, norm
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
+from preflight.probe import Probe
 
 Domain = Annotated[
     str,
@@ -26,32 +27,13 @@ NEGATIVE_CACHE = (
 Zones = Annotated[list[Label], AfterValidator(unique_by(norm))]
 
 
-class DelegationSection(Section):
-    root: Domain
-    zones: Zones
-    name_servers: dict[Label, list[Domain]]
-
-
-class UndelegatedSection(Section):
-    root: Domain
-    zones: Zones = []
-
-
 class CnameRecord(BaseModel):
     name: Domain
     target: Domain
     advisory: bool = False
 
 
-class CnameSection(Section):
-    records: Annotated[
-        list[CnameRecord], AfterValidator(unique_by(lambda record: norm(record.name)))
-    ]
-
-
-class CaaSection(Section):
-    domain: Domain
-    issuers: list[Domain] = Field(min_length=1)
+Records = Annotated[list[CnameRecord], AfterValidator(unique_by(lambda record: norm(record.name)))]
 
 
 def ns_block(name: str, servers) -> str:
@@ -74,24 +56,27 @@ def _unavailable(key: str | None, parent: str, advisory: bool = False) -> Item:
     )
 
 
-@check("dns.delegated", section=DelegationSection)
-def delegated(ctx, s: DelegationSection) -> Outcome:
-    root = norm(s.root)
+@check(key="root")
+def delegated(
+    probe: Probe,
+    root: Domain,
+    name_servers: Annotated[dict[Label, list[Domain]], Field(min_length=1)],
+) -> Outcome:
+    root = norm(root)
     items = []
-    for prefix in s.zones:
+    for prefix, servers in name_servers.items():
         name = f"{prefix}.{root}"
-        expected = {norm(server) for server in s.name_servers.get(prefix, [])}
+        expected = {norm(server) for server in servers}
         if not expected:
             items.append(
                 fail(
                     prefix,
                     do=f"{name} has no zone yet (no name servers recorded for it).",
-                    generic=True,
                 )
             )
             continue
         try:
-            referral = ctx.dns.referral(name, root)
+            referral = probe.dns.referral(name, root)
         except DnsUnavailable:
             items.append(_unavailable(prefix, root))
             continue
@@ -107,20 +92,21 @@ def delegated(ctx, s: DelegationSection) -> Outcome:
                 ),
                 paste=ns_block(name, expected),
                 observed=sorted(referral.servers),
-                generic=True,
             )
         )
     return _all(items)
 
 
-@check("dns.undelegated", section=UndelegatedSection)
-def undelegated(ctx, s: UndelegatedSection) -> Outcome:
-    root = norm(s.root)
+@check(key="root")
+def undelegated(
+    probe: Probe, root: Domain, zones: Annotated[Zones, Field(min_length=1)]
+) -> Outcome:
+    root = norm(root)
     items = []
-    for prefix in s.zones:
+    for prefix in zones:
         name = f"{prefix}.{root}"
         try:
-            referral = ctx.dns.referral(name, root)
+            referral = probe.dns.referral(name, root)
         except DnsUnavailable:
             items.append(_unavailable(prefix, root))
             continue
@@ -135,19 +121,18 @@ def undelegated(ctx, s: UndelegatedSection) -> Outcome:
                         "delegation to a zone being retired is a takeover risk."
                     ),
                     observed=sorted(referral.servers),
-                    generic=True,
                 )
             )
     return _all(items)
 
 
-@check("dns.cname", section=CnameSection)
-def cname(ctx, s: CnameSection) -> Outcome:
+@check
+def cname(probe: Probe, records: Annotated[Records, Field(min_length=1)]) -> Outcome:
     items = []
-    for record in s.records:
+    for record in records:
         name, target = norm(record.name), norm(record.target)
         try:
-            targets = ctx.dns.cname(name)
+            targets = probe.dns.cname(name)
         except DnsUnavailable:
             items.append(_unavailable(name, name, record.advisory))
             continue
@@ -167,11 +152,13 @@ def cname(ctx, s: CnameSection) -> Outcome:
     return _all(items)
 
 
-@check("dns.caa", section=CaaSection)
-def caa(ctx, s: CaaSection) -> Outcome:
-    domain = norm(s.domain)
+@check(key="domain")
+def caa(
+    probe: Probe, domain: Domain, issuers: Annotated[list[Domain], Field(min_length=1)]
+) -> Outcome:
+    domain = norm(domain)
     try:
-        records = ctx.dns.caa(domain)
+        records = probe.dns.caa(domain)
     except DnsUnavailable:
         return outcome(_unavailable(None, domain))
     allowed = set()
@@ -179,7 +166,7 @@ def caa(ctx, s: CaaSection) -> Outcome:
         parts = record.split(None, 2)
         if len(parts) == 3 and parts[1].lower() == "issue":
             allowed.add(parts[2].strip('"').split(";")[0].strip().lower())
-    missing = [issuer for issuer in s.issuers if issuer.lower() not in allowed]
+    missing = [issuer for issuer in issuers if issuer.lower() not in allowed]
     if not missing:
         return outcome(ok(observed=sorted(allowed)))
     return outcome(

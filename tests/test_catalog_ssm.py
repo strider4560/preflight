@@ -2,11 +2,11 @@ import json
 import re
 
 import pytest
-from fakes import FakeAnsibleHost, make_ctx
-from pydantic import ValidationError
+from fakes import IDENTITY, FakeAnsibleHost, make_probe, observe
 from testinfra.modules.ansible import AnsibleException
 
 from preflight.catalog import ssm
+from preflight.check import CheckCallError
 from preflight.outcome import Status
 
 NAME = re.compile(r"ssm_parameter', '([^']+)'")
@@ -22,31 +22,26 @@ def store(values):
     return FakeAnsibleHost({"ansible.builtin.debug": answer})
 
 
-def test_present(tmp_path):
-    section = ssm.PresentSection(
-        identity="admin", name="/platform/state/bucket", how="rerun bootstrap"
-    )
-    ok_ctx = make_ctx(tmp_path, ansible=store({"/platform/state/bucket": "tellabs-tfstate-dev"}))
-    assert ssm.present.observe(ok_ctx, section).status is Status.OK
-    missing = make_ctx(tmp_path, ansible=store({"/platform/state/bucket": ""}))
-    item = ssm.present.observe(missing, section).items[0]
-    assert item.status is Status.FAIL
-    assert item.next_step.do == "SSM parameter /platform/state/bucket is missing or empty."
-    assert item.next_step.paste == "rerun bootstrap"
-    assert item.next_step.generic is True
-    assert item.observed is None
-
-
-def test_parameters_reports_each_name(tmp_path):
-    section = ssm.ParametersSection(identity="admin", names=["/a", "/b", "/c"])
-    ctx = make_ctx(
+def test_each_parameter_is_its_own_item(tmp_path):
+    probe = make_probe(
         tmp_path,
         ansible=store({"/a": "1", "/b": "None", "/c": AnsibleException({"failed": True})}),
     )
-    items = {i.key: i for i in ssm.parameters.observe(ctx, section).items}
+    bound = ssm.parameters_exist(names=["/a", "/b", "/c"], identity=IDENTITY)
+    items = {i.key: i for i in observe(bound, probe).items}
     assert items["/a"].status is Status.OK
-    assert items["/b"].status is Status.FAIL
     assert (items["/c"].status, items["/c"].error_type) == (Status.ERROR, "AnsibleException")
+    missing = items["/b"]
+    assert missing.status is Status.FAIL
+    assert missing.next_step.do == (
+        "SSM parameter /b does not exist in account 111111111111 (us-east-1), or is empty. "
+        "Publish it from the stack that owns it, then confirm:"
+    )
+    assert missing.next_step.paste == (
+        "aws ssm get-parameter --name /b --profile sandbox --region us-east-1 "
+        "--query Parameter.Name --output text"
+    )
+    assert missing.observed is None
 
 
 TASK_FAILED = (
@@ -56,15 +51,16 @@ TASK_FAILED = (
 
 
 def test_lookup_failure_message_is_an_error_and_not_leaked(tmp_path):
-    ctx = make_ctx(tmp_path, ansible=store({"/a": TASK_FAILED}))
-    outcome = ssm.parameters.observe(ctx, ssm.ParametersSection(identity="admin", names=["/a"]))
-    item = outcome.items[0]
-    assert (item.status, item.error_type) == (Status.ERROR, "ModuleFailed")
-    assert "SECRET" not in json.dumps(item.to_dict())
-    single = ssm.present.observe(ctx, ssm.PresentSection(identity="admin", name="/a")).items[0]
-    assert (single.status, single.error_type) == (Status.ERROR, "ModuleFailed")
+    probe = make_probe(tmp_path, ansible=store({"/a": TASK_FAILED}))
+    result = observe(ssm.parameters_exist(names=["/a"], identity=IDENTITY), probe)
+    assert result.items[0].status is Status.ERROR
+    assert "SECRET" not in json.dumps(result.to_dict())
 
 
-def test_parameter_names_are_unique():
-    with pytest.raises(ValidationError, match="duplicate entries: /a"):
-        ssm.ParametersSection(identity="admin", names=["/a", "/b", "/a"])
+def test_names_are_unique_valid_and_not_empty():
+    with pytest.raises(CheckCallError, match="duplicate entries: /a"):
+        ssm.parameters_exist(names=["/a", "/b", "/a"], identity=IDENTITY)
+    with pytest.raises(CheckCallError, match="names"):
+        ssm.parameters_exist(names=[], identity=IDENTITY)
+    with pytest.raises(CheckCallError, match="names.0"):
+        ssm.parameters_exist(names=["no-slash"], identity=IDENTITY)

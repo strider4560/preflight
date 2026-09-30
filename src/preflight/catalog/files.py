@@ -4,45 +4,41 @@ git status only; never the contents."""
 from __future__ import annotations
 
 import shlex
+from typing import Annotated
 
 from pydantic import Field
 
-from preflight.check import Section, UniqueList, check
+from preflight.check import UniqueList, check
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
+from preflight.probe import Probe
+
+Paths = Annotated[UniqueList[str], Field(min_length=1)]
 
 
-class FilesSection(Section):
-    paths: UniqueList[str] = Field(min_length=1)
+def _exists(probe: Probe, path: str) -> bool:
+    return probe.host.file(str(probe.path(path))).exists
 
 
-def _exists(ctx, path: str) -> bool:
-    return ctx.host.file(str(ctx.path(path))).exists
+@check
+def present(probe: Probe, paths: Paths) -> Outcome:
+    return outcome(*(ok(p) if _exists(probe, p) else fail(p, do=f"Create {p}.") for p in paths))
 
 
-@check("files.present", section=FilesSection)
-def present(ctx, s: FilesSection) -> Outcome:
-    return outcome(
-        *(ok(p) if _exists(ctx, p) else fail(p, do=f"Create {p}.", generic=True) for p in s.paths)
-    )
+@check
+def absent(probe: Probe, paths: Paths) -> Outcome:
+    return outcome(*(fail(p, do=f"Remove {p}.") if _exists(probe, p) else ok(p) for p in paths))
 
 
-@check("files.absent", section=FilesSection)
-def absent(ctx, s: FilesSection) -> Outcome:
-    return outcome(
-        *(fail(p, do=f"Remove {p}.", generic=True) if _exists(ctx, p) else ok(p) for p in s.paths)
-    )
-
-
-def _ignored(ctx, path: str) -> Item:
-    root, quoted = str(ctx.root), shlex.quote(path)
+def _ignored(probe: Probe, path: str) -> Item:
+    root, quoted = str(probe.root), shlex.quote(path)
     # git never reports a tracked file as ignored, so adding it to .gitignore would not help.
-    if ctx.host.run("git -C %s ls-files --error-unmatch -- %s", root, path).rc == 0:
+    if probe.host.run("git -C %s ls-files --error-unmatch -- %s", root, path).rc == 0:
         return fail(
             path,
             do=f"{path} is committed; untrack it, then keep it ignored.",
             paste=f"git rm --cached -- {quoted} && echo {quoted} >> .gitignore",
         )
-    result = ctx.host.run("git -C %s check-ignore -q -- %s", root, path)
+    result = probe.host.run("git -C %s check-ignore -q -- %s", root, path)
     if result.rc == 0:
         return ok(path)
     if result.rc == 1:
@@ -50,15 +46,15 @@ def _ignored(ctx, path: str) -> Item:
     return error(path, do="git could not check .gitignore here.", error_type="GitError")
 
 
-@check("files.git_ignored", section=FilesSection)
-def git_ignored(ctx, s: FilesSection) -> Outcome:
-    return outcome(*(_ignored(ctx, p) for p in s.paths))
+@check
+def git_ignored(probe: Probe, paths: Paths) -> Outcome:
+    return outcome(*(_ignored(probe, p) for p in paths))
 
 
-def _committed(ctx, path: str) -> Item:
-    root = str(ctx.root)
-    tracked = ctx.host.run("git -C %s ls-files --error-unmatch -- %s", root, path).rc == 0
-    clean = tracked and ctx.host.run("git -C %s diff --quiet HEAD -- %s", root, path).rc == 0
+def _committed(probe: Probe, path: str) -> Item:
+    root = str(probe.root)
+    tracked = probe.host.run("git -C %s ls-files --error-unmatch -- %s", root, path).rc == 0
+    clean = tracked and probe.host.run("git -C %s diff --quiet HEAD -- %s", root, path).rc == 0
     if clean:
         return ok(path)
     return fail(
@@ -68,10 +64,9 @@ def _committed(ctx, path: str) -> Item:
             f"git add -- {shlex.quote(path)} && "
             f"git commit -m {shlex.quote(f'chore: commit {path}')}"
         ),
-        generic=True,
     )
 
 
-@check("files.committed", section=FilesSection)
-def committed(ctx, s: FilesSection) -> Outcome:
-    return outcome(*(_committed(ctx, p) for p in s.paths))
+@check
+def committed(probe: Probe, paths: Paths) -> Outcome:
+    return outcome(*(_committed(probe, p) for p in paths))

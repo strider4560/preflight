@@ -1,172 +1,283 @@
-"""Gates: named sets of check instances in the consumer's repository, loaded by file path.
-
-The consumer directory (the parent of `gates/`) is imported as the package `consumer`, so a gate
-imports repo-local checks as `consumer.checks.<file>`. Nothing is added to `sys.path`."""
+"""Gates: guards run in declaration order, each a function returning checks. `run()` parses the
+command line, resolves dependencies, runs each guard's checks in workers, and stops at the first
+guard that does not pass."""
 
 from __future__ import annotations
 
-import importlib
-import re
+import contextlib
+import signal
+import subprocess
 import sys
-import types
-from dataclasses import dataclass
+import threading
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, NoReturn, TypeVar
 
-from preflight.check import CheckInstance
+from preflight.check import BoundCheck, CheckCallError
+from preflight.params import (
+    GateDefinitionError,
+    Propagate,
+    ProviderFailed,
+    Resolver,
+    Unmet,
+    collect_args,
+    parse_args,
+)
+from preflight.render import CheckResult, GuardResult, RunResult, worklist
+from preflight.runner import Executor, StandInExecutor, WorkerExecutor, using
+from preflight.worker import kill_all, reset_stop
 
-STEM = re.compile(r"^[a-z][a-z0-9_]*$")
-
-
-class GateError(Exception):
-    def __init__(self, problems: list[str]):
-        self.problems = list(problems)
-        super().__init__("; ".join(self.problems))
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 @dataclass(frozen=True)
-class Gate:
+class Guard:
     name: str
-    checks: tuple[CheckInstance, ...]
-    requires: tuple[str, ...] = ()
-    guards: str | None = None
-    scope: Literal["environment", "repository"] = "environment"
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.requires, (list, tuple)) or not all(
-            isinstance(r, str) and STEM.match(r) for r in self.requires
-        ):
-            raise GateError(
-                [f"gate {self.name}: requires must be a list of gate names (lowercase file stems)"]
-            )
-        if self.guards is not None and not isinstance(self.guards, str):
-            raise GateError([f"gate {self.name}: guards must be a string or None"])
-        object.__setattr__(self, "checks", tuple(self.checks))
-        object.__setattr__(self, "requires", tuple(self.requires))
-        if not self.checks:
-            raise GateError([f"gate {self.name} has no checks"])
-        for instance in self.checks:
-            if not isinstance(instance, CheckInstance):
-                raise GateError(
-                    [
-                        f"gate {self.name}: {instance!r} is not bound; "
-                        "call the check with a section name"
-                    ]
-                )
-        if self.scope not in ("environment", "repository"):
-            raise GateError([f"gate {self.name}: scope must be environment or repository"])
-
-    @property
-    def milestone(self) -> bool:
-        return self.guards is None
+    fn: Callable[..., Any]
 
 
-def register_consumer(consumer_dir: Path) -> None:
-    consumer_dir = consumer_dir.resolve()
-    existing = sys.modules.get("consumer")
-    if existing is not None:
-        if list(getattr(existing, "__path__", [])) == [str(consumer_dir)]:
-            return
-        raise GateError([f"another consumer directory is already loaded: {existing.__path__[0]}"])
-    package = types.ModuleType("consumer")
-    package.__path__ = [str(consumer_dir)]
-    package.__package__ = "consumer"
-    sys.modules["consumer"] = package
-    importlib.invalidate_caches()
+class Guards:
+    """Guards in declaration order; a gate includes them where `include` is called."""
+
+    def __init__(self) -> None:
+        self.entries: list[Guard | Guards] = []
+
+    def guard(self, name: str) -> Callable[[F], F]:
+        def decorate(fn: F) -> F:
+            self.entries.append(Guard(name, fn))
+            return fn
+
+        return decorate
+
+    def include(self, guards: Guards) -> None:
+        self.entries.append(guards)
+
+    def flatten(self, trail: tuple[Guards, ...] = ()) -> list[Guard]:
+        if self in trail:
+            raise GateDefinitionError(["guards include each other in a cycle"])
+        found: list[Guard] = []
+        for entry in self.entries:
+            if isinstance(entry, Guard):
+                found.append(entry)
+            elif isinstance(entry, Guards) and not isinstance(entry, Gate):
+                found.extend(entry.flatten((*trail, self)))
+            else:
+                raise GateDefinitionError([f"include takes a Guards(), not {type(entry).__name__}"])
+        return found
 
 
-def unload_consumer() -> None:
-    for name in [n for n in sys.modules if n == "consumer" or n.startswith("consumer.")]:
-        del sys.modules[name]
-    importlib.invalidate_caches()
+class Gate(Guards):
+    def __init__(self, name: str, *, jobs: int = 4) -> None:
+        super().__init__()
+        self.name = name
+        self.jobs = jobs
+        self.dependency_overrides: dict[Callable[..., Any], Callable[..., Any]] = {}
+        caller = sys._getframe(1).f_globals.get("__file__")
+        self.file: Path | None = Path(caller).resolve() if caller else None
 
+    def run(self, argv: Sequence[str] | None = None) -> NoReturn:
+        def progress(name: str) -> None:
+            print(f"… {name}", file=sys.stderr, flush=True)
 
-def load_gate_file(path: Path) -> Gate:
-    path = path.resolve()
-    if path.suffix != ".py" or path.parent.name != "gates":
-        raise GateError([f"{path}: a gate is a .py file in a gates/ directory"])
-    if not STEM.match(path.stem):
-        raise GateError([f"{path.name}: gate file names are lowercase letters, digits and _"])
-    register_consumer(path.parent.parent)
-    try:
-        module = importlib.import_module(f"consumer.gates.{path.stem}")
-    except SyntaxError as exc:
-        raise GateError(
-            [f"{path.name}: cannot be loaded (SyntaxError at line {exc.lineno})"]
-        ) from None
-    except (Exception, SystemExit) as exc:
-        # Only the type: an exception's message may carry a value the gate file read.
-        raise GateError([f"{path.name}: cannot be loaded ({type(exc).__name__})"]) from None
-    gate = getattr(module, "gate", None)
-    if not isinstance(gate, Gate):
-        raise GateError([f"{path.name}: defines no `gate = Gate(...)`"])
-    if gate.name != path.stem:
-        raise GateError(
-            [f"{path.name}: the gate is named {gate.name!r}; name it {path.stem!r} after its file"]
-        )
-    return gate
-
-
-def load_closure(path: Path) -> list[Gate]:
-    """The gate and every gate it requires, transitively, required gates first."""
-    gates_dir = path.resolve().parent
-    first = load_gate_file(path)
-    found = {first.name: first}
-    pending = list(first.requires)
-    problems = []
-    while pending:
-        name = pending.pop()
-        if name in found:
-            continue
-        candidate = gates_dir / f"{name}.py"
-        if not candidate.is_file():
-            problems.append(f"gate {name!r} is required but {candidate.name} does not exist")
-            continue
-        found[name] = load_gate_file(candidate)
-        pending.extend(found[name].requires)
-    if problems:
-        raise GateError(problems)
-    return order_gates(list(found.values()))
-
-
-def load_directory(gates_dir: Path) -> list[Gate]:
-    files = sorted(p for p in gates_dir.glob("*.py") if not p.name.startswith("_"))
-    if not files:
-        raise GateError([f"{gates_dir} holds no gate files"])
-    gates, problems = [], []
-    for path in files:
         try:
-            gates.append(load_gate_file(path))
-        except GateError as exc:
-            problems.extend(exc.problems)
-    names = {g.name for g in gates}
-    for gate in gates:
-        problems.extend(
-            f"gate {gate.name} requires unknown gate {r!r}" for r in gate.requires if r not in names
+            with _terminate_as_interrupt():
+                result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
+        sys.stdout.write(result.output)
+        sys.stdout.flush()
+        raise SystemExit(result.exit_code)
+
+    def execute(
+        self,
+        argv: Sequence[str],
+        *,
+        executor: Executor | None = None,
+        root: Path | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> RunResult:
+        base = RunResult(self.name, tuple(argv), exit_code=2)
+        try:
+            return self._execute(base, executor, root, progress)
+        except Propagate:
+            raise
+        except Exception as exc:
+            problem = f"preflight failed ({type(exc).__name__})"
+            return _finish(replace(base, exit_code=3, problems=(problem,)))
+
+    def _execute(
+        self,
+        base: RunResult,
+        executor: Executor | None,
+        root: Path | None,
+        progress: Callable[[str], None] | None,
+    ) -> RunResult:
+        try:
+            guards = self._guards()
+            specs = collect_args([g.fn for g in guards], self.dependency_overrides)
+        except GateDefinitionError as exc:
+            return _finish(replace(base, problems=tuple(exc.problems)))
+        try:
+            values, validate = parse_args(self._prog(), specs, base.arguments)
+        except SystemExit:  # argparse printed usage or help; neither is a pass
+            return replace(base, exit_code=2)
+        try:
+            root = root or self._root()
+        except GateDefinitionError as exc:
+            return _finish(replace(base, problems=tuple(exc.problems)))
+        if validate:
+            executor = StandInExecutor()
+        elif executor is None:
+            gate_dir = self.file.parent if self.file else root
+            executor = WorkerExecutor(root=root, gate_dir=gate_dir, jobs=self.jobs)
+        base = replace(base, validated=validate)
+        return _finish(self._run(base, guards, values, executor, progress))
+
+    def _run(
+        self,
+        base: RunResult,
+        guards: list[Guard],
+        values: dict[str, Any],
+        executor: Executor,
+        progress: Callable[[str], None] | None,
+    ) -> RunResult:
+        results: list[GuardResult] = []
+        problems: list[str] = []
+        exit_code = 0
+        attempted = 0
+        current: str | None = None  # the guard being attempted, named if it is cut short
+        reset_stop()
+        stack = contextlib.ExitStack()
+        resolver = Resolver(values, self.dependency_overrides, stack)
+        try:
+            with using(executor):
+                for guard in guards:
+                    attempted += 1
+                    current = guard.name
+                    if progress:
+                        progress(guard.name)
+                    result, problem = self._guard(guard, resolver, executor)
+                    current = None
+                    if problem is not None:
+                        problems.append(problem)
+                        exit_code = 2
+                        break
+                    results.append(result)
+                    if not result.passed:
+                        exit_code = 1
+                        break
+        except KeyboardInterrupt:
+            kill_all()
+            exit_code = 130
+            problems.append(f"interrupted during guard {current!r}" if current else "interrupted")
+        except Propagate:
+            raise
+        except Exception as exc:
+            kill_all()
+            exit_code = 3
+            where = f" in guard {current!r}" if current else ""
+            problems.append(f"preflight failed{where} ({type(exc).__name__})")
+        finally:
+            stack.close()
+        problems.extend(resolver.cleanup_problems)
+        if resolver.cleanup_problems and exit_code == 0:
+            exit_code = 3
+        return replace(
+            base,
+            exit_code=exit_code,
+            guards=tuple(results),
+            not_run=tuple(g.name for g in guards[attempted:]),
+            problems=tuple(problems),
         )
-    if problems:
-        raise GateError(problems)
-    return order_gates(gates)
+
+    def _guard(
+        self, guard: Guard, resolver: Resolver, executor: Executor
+    ) -> tuple[GuardResult | None, str | None]:
+        try:
+            kwargs = resolver.arguments(guard.fn)
+        except Unmet as exc:
+            return GuardResult(guard.name, unmet=exc.items, unmet_by=exc.provider), None
+        except ProviderFailed as exc:
+            return None, f"guard {guard.name!r}: {exc}"
+        try:
+            checks = guard.fn(**kwargs)
+        except CheckCallError as exc:
+            return None, f"guard {guard.name!r}: {exc}"
+        except (Exception, SystemExit) as exc:
+            return None, f"guard {guard.name!r} raised {type(exc).__name__}"
+        if (
+            not isinstance(checks, list)
+            or not checks
+            or not all(isinstance(c, BoundCheck) for c in checks)
+        ):
+            return None, f"guard {guard.name!r} must return a non-empty list of checks"
+        outcomes = executor.run(checks)
+        pairs = zip(_labels(checks), outcomes, strict=True)
+        return GuardResult(guard.name, tuple(CheckResult(label, o) for label, o in pairs)), None
+
+    def _guards(self) -> list[Guard]:
+        guards = self.flatten()
+        if not guards:
+            raise GateDefinitionError([f"gate {self.name} has no guards"])
+        repeated = sorted(n for n, c in Counter(g.name for g in guards).items() if c > 1)
+        if repeated:
+            raise GateDefinitionError([f"guard name used twice: {n}" for n in repeated])
+        return guards
+
+    def _prog(self) -> str:
+        return self.file.name if self.file else self.name
+
+    def _root(self) -> Path:
+        if self.file is None:
+            raise GateDefinitionError(["the gate's file is unknown; define the gate in a file"])
+        try:
+            done = subprocess.run(
+                ["git", "-C", str(self.file.parent), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            raise GateDefinitionError(["git is not available"]) from None
+        if done.returncode != 0:
+            raise GateDefinitionError([f"{self.file.name} is not inside a git work tree"])
+        return Path(done.stdout.strip()).resolve()
 
 
-def order_gates(gates: list[Gate]) -> list[Gate]:
-    by_name = {g.name: g for g in gates}
-    state: dict[str, str] = {}
-    ordered: list[Gate] = []
+@contextlib.contextmanager
+def _terminate_as_interrupt() -> Iterator[None]:
+    """SIGTERM and SIGHUP (a cancelled CI job, a closed terminal) interrupt the run as Ctrl-C
+    does, so workers are killed and providers clean up; the previous handlers are restored."""
 
-    def visit(gate: Gate, trail: list[str]) -> None:
-        if state.get(gate.name) == "done":
-            return
-        if state.get(gate.name) == "active":
-            cycle = " -> ".join([*trail, gate.name])
-            raise GateError([f"gates require each other in a cycle: {cycle}"])
-        state[gate.name] = "active"
-        for required in sorted(gate.requires):
-            if required in by_name:
-                visit(by_name[required], [*trail, gate.name])
-        state[gate.name] = "done"
-        ordered.append(gate)
+    def interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
 
-    for gate in sorted(gates, key=lambda g: g.name):
-        visit(gate, [])
-    return ordered
+    previous: dict[int, Any] = {}
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for name in ("SIGTERM", "SIGHUP"):
+                number = getattr(signal, name, None)
+                if number is not None:
+                    previous[number] = signal.signal(number, interrupt)
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, signal.SIG_DFL if handler is None else handler)
+
+
+def _labels(checks: Sequence[BoundCheck]) -> list[str]:
+    counts = Counter(c.label for c in checks)
+    seen: Counter[str] = Counter()
+    labels = []
+    for bound in checks:
+        if counts[bound.label] > 1:
+            seen[bound.label] += 1
+            labels.append(f"{bound.label} #{seen[bound.label]}")
+        else:
+            labels.append(bound.label)
+    return labels
+
+
+def _finish(result: RunResult) -> RunResult:
+    return replace(result, output=worklist(result))

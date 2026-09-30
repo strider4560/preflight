@@ -1,209 +1,167 @@
-# tests/test_render.py
-import stat
-from pathlib import Path
-from xml.etree import ElementTree
-
-from preflight.contract import Contract
-from preflight.graph import Node
 from preflight.outcome import Item, Status, error, fail, ok, outcome, pending
-from preflight.render import (
-    instance_json,
-    open_steps,
-    render_check,
-    report_json,
-    to_junit,
-    write_json,
-    write_text,
-)
-from preflight.runner import NodeResult
+from preflight.render import NO_NEXT_STEP, CheckResult, GuardResult, RunResult, worklist
 
-CONTRACT = Contract(
-    path=Path("dev.toml"),
-    root=Path("/tmp"),
-    scope="environment",
-    environment="dev",
-    identity_data={},
-    sections={},
-    placeholders=[],
-    inputs={},
+ASSUMED = CheckResult(
+    "aws.assumed",
+    outcome(
+        fail(
+            do="Your shell acts as account 5035; the next command needs 7113.",
+            paste="export AWS_PROFILE=sandbox",
+        )
+    ),
 )
 
 
-def result(node_id, out=None, blocked_by=()):
-    node = Node(
-        id=node_id,
-        check_id=node_id.split("[")[0],
-        key=node_id,
-        gates=["delegation"],
-        contract=CONTRACT,
-        data={},
-        identity=None,
-        section_bound=False,
-    )
-    status = Status.BLOCKED if out is None else out.status
-    return NodeResult(node, status, out, list(blocked_by), 0.5)
-
-
-RESULTS = {
-    r.node.id: r
-    for r in [
-        result("aws.session[admin]", outcome(ok())),
-        result(
-            "dns.delegated[delegation]",
-            outcome(
-                fail(
-                    "app",
-                    do="In Administration, set NS app.tellabs.dev to exactly these servers:",
-                    paste="app.tellabs.dev. NS ns-1.example.\napp.tellabs.dev. NS ns-2.example.",
-                    wait="up to 15 minutes",
-                    ref="README, DNS step 1",
-                ),
-                ok("api"),
+def test_a_stopped_run_lists_passed_guards_the_open_steps_and_what_did_not_run():
+    result = RunResult(
+        "bootstrap_entry",
+        ("dev",),
+        exit_code=1,
+        guards=(
+            GuardResult("IDs filled in", (CheckResult("iac.filled", outcome(ok("account_id"))),)),
+            GuardResult(
+                "this shell is the account's administrator",
+                (ASSUMED, CheckResult("aws.region", outcome(ok()))),
             ),
         ),
-        result("acm.issued[root_certificate]", blocked_by=["dns.delegated[delegation]"]),
-        result(
-            "dns.cname[aliases]",
-            outcome(fail("vault", do="Add CNAME vault.tellabs.dev.", advisory=True)),
+        not_run=("the checkout holds the latest main",),
+    )
+    assert worklist(result) == (
+        "preflight bootstrap_entry dev\n"
+        "\n"
+        "  ✓ IDs filled in\n"
+        "  ✗ this shell is the account's administrator\n"
+        "      FAIL    aws.assumed\n"
+        "              Your shell acts as account 5035; the next command needs 7113.\n"
+        "                export AWS_PROFILE=sandbox\n"
+        "      ok      aws.region\n"
+        "\n"
+        "Stopped at: this shell is the account's administrator\n"
+        "Not run: the checkout holds the latest main\n"
+    )
+
+
+def test_item_keys_extend_labels_and_identical_steps_merge():
+    step = {"do": "Fill it.", "paste": "gh api orgs/x --jq .id"}
+    guard = GuardResult(
+        "IDs filled in",
+        (
+            CheckResult(
+                "iac.filled(common.tfvars)",
+                outcome(fail("github_org_id", **step), fail("iac_repo_id", **step)),
+            ),
         ),
-    ]
-}
-
-EXPECTED = """preflight check delegation (dev)
-
-  ok       aws.session[admin]
-  FAIL     dns.delegated[delegation]:app
-  ok       dns.delegated[delegation]:api
-  blocked  acm.issued[root_certificate]  (waits on: dns.delegated[delegation])
-  warn     dns.cname[aliases]:vault
-
-Open steps:
-> NEXT  dns.delegated[delegation]:app
-        In Administration, set NS app.tellabs.dev to exactly these servers:
-          app.tellabs.dev. NS ns-1.example.
-          app.tellabs.dev. NS ns-2.example.
-        wait: up to 15 minutes
-        see: README, DNS step 1
-        then unblocks: acm.issued[root_certificate]
-
-Warnings:
-  dns.cname[aliases]:vault: Add CNAME vault.tellabs.dev.
-"""
-
-
-def test_the_worklist():
-    assert render_check("preflight check delegation (dev)", RESULTS, color=False) == EXPECTED
-
-
-def test_color_only_when_asked():
-    assert "\033[31mFAIL" in render_check("t", RESULTS, color=True)
-    assert "\033" not in render_check("t", RESULTS, color=False)
-
-
-def test_nothing_open():
-    text = render_check("t", {"a": result("a[x]", outcome(ok()))}, color=False)
-    assert text.endswith("Nothing open.\n")
-
-
-def test_pending_comes_after_failures_and_identical_steps_merge():
-    results = {
-        r.node.id: r
-        for r in [
-            result("a[x]", outcome(pending(wait="an hour"))),
-            result("b[x]", outcome(fail("1", do="Same."), fail("2", do="Same."))),
-        ]
-    }
-    steps = open_steps(results)
-    assert [s.item_id for s in steps] == ["b[x]:1", "a[x]"]
-    assert steps[0].also == ("b[x]:2",)
-
-
-def test_json_items_carry_the_public_next_step_shape():
-    data = instance_json(RESULTS["dns.delegated[delegation]"])
-    assert data["status"] == "fail"
-    assert data["gate"] == "delegation"
-    assert set(data["items"][0]["next_step"]) == {"do", "paste", "wait", "ref"}
-    report = report_json(
-        command="check",
-        exit_code=1,
-        started="s",
-        finished="f",
-        inputs={"a": "1"},
-        runs=[],
-        steps=open_steps(RESULTS),
-        inputs_changed=[],
     )
-    assert report["next"] == "dns.delegated[delegation]:app"
-    assert report["inputs"] == [{"path": "a", "sha256": "1"}]
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert (
+        "      FAIL    iac.filled(common.tfvars):github_org_id, "
+        "iac.filled(common.tfvars):iac_repo_id\n"
+        "              Fill it.\n"
+        "                gh api orgs/x --jq .id\n"
+    ) in text
 
 
-def test_json_files_are_private(tmp_path):
-    path = tmp_path / "out.json"
-    write_json(path, {"a": 1})
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert path.read_text() == '{\n  "a": 1\n}\n'
-
-
-def test_junit_never_skips():
-    extra = {"e[x]": result("e[x]", outcome(error(do="Sign in.", error_type="Timeout")))}
-    text = to_junit("dev", {**RESULTS, **extra})
-    suite = ElementTree.fromstring(text.split("?>", 1)[1])
-    assert (suite.get("tests"), suite.get("failures"), suite.get("errors")) == ("6", "2", "1")
-    assert "skipped" not in text
-    vault = suite.find("testcase[@name='dns.cname[aliases]:vault']")
-    assert vault.find("system-out").text == "warning: Add CNAME vault.tellabs.dev."
-
-
-def test_json_open_lists_merged_items():
-    results = {
-        "b[x]": result("b[x]", outcome(fail("1", do="Same."), fail("2", do="Same."))),
-    }
-    steps = open_steps(results)
-    report = report_json(
-        command="check",
-        exit_code=1,
-        started="s",
-        finished="f",
-        inputs={},
-        runs=[],
-        steps=steps,
-        inputs_changed=[],
+def test_unmet_items_show_under_the_guard_with_their_provider():
+    guard = GuardResult(
+        "bootstrap published",
+        unmet=(error(do="Sign in to profile sandbox.", paste="aws sso login --profile sandbox"),),
+        unmet_by="admin",
     )
-    assert report["open"] == ["b[x]:1", "b[x]:2"]
-    assert report["next"] == "b[x]:1"
+    text = worklist(RunResult("bootstrap", ("dev",), exit_code=1, guards=(guard,)))
+    assert "      ERROR   needs admin\n              Sign in to profile sandbox.\n" in text
 
 
-def test_pending_items_with_different_waits_stay_separate():
-    results = {
-        "a[x]": result("a[x]", outcome(pending(wait="an hour"))),
-        "b[x]": result("b[x]", outcome(pending(wait="a day"))),
-    }
-    steps = open_steps(results)
-    assert [s.next_step.wait for s in steps] == ["an hour", "a day"]
+def test_an_error_names_its_type_after_the_labels():
+    step = {"do": "Install the GitHub CLI (gh).", "error_type": "MissingTool"}
+    guard = GuardResult(
+        "repository ready",
+        (
+            CheckResult("github.variables", outcome(error(**step))),
+            CheckResult("github.secrets", outcome(error(**step))),
+        ),
+    )
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert (
+        "      ERROR   github.variables, github.secrets (MissingTool)\n"
+        "              Install the GitHub CLI (gh).\n"
+    ) in text
 
 
-def test_write_json_tightens_an_existing_file(tmp_path):
-    path = tmp_path / "out.json"
-    path.write_text("old")
-    path.chmod(0o644)
-    write_json(path, {"a": 1})
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert path.read_text() == '{\n  "a": 1\n}\n'
-    assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
+def test_wait_ref_and_warnings():
+    guard = GuardResult(
+        "delegated",
+        (
+            CheckResult(
+                "dns.cname",
+                outcome(
+                    fail("a.dev", do="Add the CNAME.", wait="up to an hour", ref="README"),
+                    fail("b.dev", do="Add the other.", advisory=True),
+                ),
+            ),
+        ),
+    )
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert "              wait: up to an hour\n              see: README\n" in text
+    assert "Warnings:\n  ! dns.cname:b.dev  Add the other.\n" in text
 
 
-def test_a_failure_without_a_next_step_is_still_open():
-    results = {"k[x]": result("k[x]", outcome(Item("k", Status.FAIL)))}
-    steps = open_steps(results)
-    assert [s.item_id for s in steps] == ["k[x]:k"]
-    assert "No next step was recorded" in render_check("t", results, color=False)
+def test_passing_validated_and_problem_footers():
+    passed = RunResult("g", guards=(GuardResult("one", (CheckResult("c", outcome(ok())),)),))
+    assert worklist(passed).endswith("  ✓ one\n\nEvery guard passed.\n")
+    validated = RunResult("g", ("dev", "--validate"), validated=True, guards=passed.guards)
+    assert worklist(validated).endswith("Validated every guard; nothing was observed.\n")
+    broken = RunResult("g", exit_code=2, problems=("provider admin raised KeyError",))
+    assert worklist(broken) == "preflight g\n\n\nProblems:\n  - provider admin raised KeyError\n"
 
 
-def test_write_text_is_atomic_private_and_utf8(tmp_path):
-    path = tmp_path / "r.xml"
-    path.write_text("old")
-    path.chmod(0o644)
-    write_text(path, "→ é\n")
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert path.read_bytes() == "→ é\n".encode()
-    assert [p.name for p in tmp_path.iterdir()] == ["r.xml"]
+def test_stopped_at_is_the_first_guard_that_did_not_pass():
+    good = GuardResult("one", (CheckResult("c", outcome(ok())),))
+    bad = GuardResult("two", (CheckResult("c", outcome(fail(do="x"))),))
+    assert RunResult("g", guards=(good, bad)).stopped_at == "two"
+    assert RunResult("g", guards=(good,)).stopped_at is None
+
+
+def test_multi_line_do_indents_every_line():
+    guard = GuardResult("g1", (CheckResult("c", outcome(fail(do="First line.\nSecond line."))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert f"\n{' ' * 14}First line.\n{' ' * 14}Second line.\n" in text
+
+
+def test_pending_item_shows_status_column_and_wait():
+    guard = GuardResult("g1", (CheckResult("cache", outcome(pending(wait="5 minutes"))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert "      pending cache\n" in text
+    assert "              wait: 5 minutes\n" in text
+
+
+def test_item_without_next_step_renders_the_placeholder():
+    guard = GuardResult("g1", (CheckResult("c", outcome(Item("k", Status.FAIL))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert f"      FAIL    c:k\n              {NO_NEXT_STEP.do}\n" in text
+
+
+def test_unmet_items_come_before_check_items():
+    guard = GuardResult(
+        "g1",
+        (CheckResult("c", outcome(fail(do="Check step."))),),
+        unmet=(error(do="Unmet step."),),
+        unmet_by="admin",
+    )
+    labels = [label for label, _ in guard.labelled_items()]
+    assert labels == ["needs admin", "c"]
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert text.index("needs admin") < text.index("      FAIL    c")
+
+
+def test_advisory_only_guard_passes_and_warns():
+    guard = GuardResult(
+        "g1", (CheckResult("c", outcome(fail(do="Consider this.", advisory=True))),)
+    )
+    assert guard.passed
+    text = worklist(RunResult("g", guards=(guard,)))
+    assert "  ✓ g1\n" in text
+    assert "Warnings:\n  ! c  Consider this.\n" in text
+
+
+def test_no_guards_and_exit_zero_passes():
+    assert worklist(RunResult("g")) == "preflight g\n\n\nEvery guard passed.\n"

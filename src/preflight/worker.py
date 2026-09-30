@@ -1,14 +1,14 @@
-"""One check instance in its own process.
+"""One bound check in its own process.
 
-`python -m preflight.worker` reads a job as JSON on stdin and writes the outcome as JSON to a
+`python -P -m preflight.worker` reads a job as JSON on stdin and writes the outcome as JSON to a
 private copy of the original stdout, taken before the check runs; the check's own prints go to
 stderr. Nothing else leaves the process: the launcher discards stderr, and kills the whole
-process group when the instance runs out of time."""
+process group when the check runs out of time."""
 
 from __future__ import annotations
 
-import datetime
 import importlib
+import importlib.util
 import json
 import os
 import signal
@@ -18,29 +18,23 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from types import ModuleType
 
-from pydantic import ValidationError
-
-from preflight.check import REGISTRY
-from preflight.context import Context
-from preflight.gate import register_consumer
+from preflight.check import Check
 from preflight.identity import Identity
 from preflight.outcome import Outcome, error, outcome
-from preflight.resolvers import LazySsm, ResolveError, apply_ssm_value
+from preflight.probe import Probe
 
 
 @dataclass(frozen=True)
 class Job:
-    node_id: str
-    check_id: str
+    label: str
     module: str
-    consumer_dir: str | None
+    file: str | None
+    name: str
+    gate_dir: str | None
     root: str
-    environment: str | None
-    data: dict[str, Any]
-    identity: dict[str, Any] | None
-    identities: dict[str, dict[str, Any]]
+    arguments: str
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -50,109 +44,50 @@ class Job:
         return cls(**json.loads(text))
 
 
-def encode_data(value: Any) -> Any:
-    if isinstance(value, datetime.date | datetime.time):  # datetime is a date
-        return value.isoformat()
-    if isinstance(value, LazySsm):
-        return value.to_dict()
-    if isinstance(value, dict):
-        return {key: encode_data(element) for key, element in value.items()}
-    if isinstance(value, list):
-        return [encode_data(element) for element in value]
-    return value
+def load_module(job: Job) -> ModuleType:
+    """The check's module. A gate file loads by path under a name of its own, so its
+    `if __name__ == "__main__": gate.run()` does not fire. The gate's directory is appended to
+    the path, after preflight's own imports, so a gate's modules cannot shadow them."""
+    if job.gate_dir and job.gate_dir not in sys.path:
+        sys.path.append(job.gate_dir)
+    if job.module != "__main__":
+        return importlib.import_module(job.module)
+    if not job.file:
+        raise ImportError("the gate file is unknown")
+    name = f"preflight_gate_{Path(job.file).stem}"
+    spec = importlib.util.spec_from_file_location(name, job.file)
+    if spec is None or spec.loader is None:
+        raise ImportError(job.file)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def decode_data(value: Any) -> Any:
-    if isinstance(value, dict):
-        if set(value) == {"__lazy_ssm__"}:
-            return LazySsm.from_dict(value)
-        return {key: decode_data(element) for key, element in value.items()}
-    if isinstance(value, list):
-        return [decode_data(element) for element in value]
-    return value
-
-
-class _Unresolved(Exception):
-    pass
-
-
-def _resolve_lazy(value: Any, ctx: Context) -> Any:
-    if isinstance(value, LazySsm):
-        identity = ctx.identities.get(value.identity)
-        if identity is None:
-            raise _Unresolved(
-                f"SSM parameter {value.name} needs identity {value.identity}, "
-                "which is not filled in."
-            )
-        raw = ctx.ssm_lookup(value.name, identity=identity)
-        if raw is None:
-            raise _Unresolved(f"SSM parameter {value.name} is missing.")
-        try:
-            return apply_ssm_value(raw, value)
-        except ResolveError as exc:
-            raise _Unresolved(f"SSM parameter {value.name}: {exc}.") from None
-    if isinstance(value, dict):
-        return {key: _resolve_lazy(element, ctx) for key, element in value.items()}
-    if isinstance(value, list):
-        return [_resolve_lazy(element, ctx) for element in value]
-    return value
-
-
-def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> Outcome:
+def execute(job: Job, *, probe_factory: Callable[..., Probe] = Probe) -> Outcome:
     """Runs inside the worker; every failure becomes an error outcome carrying only a type."""
     try:
-        if job.consumer_dir:
-            register_consumer(Path(job.consumer_dir))
-        importlib.import_module(job.module)
-        check = REGISTRY[job.check_id]
-        identities = {
-            alias: Identity.model_validate(spec) for alias, spec in job.identities.items()
-        }
-        identity = Identity.model_validate(job.identity) if job.identity else None
+        check = getattr(load_module(job), job.name)
+        if not isinstance(check, Check):
+            raise TypeError(f"{job.name} is not a check")
+        arguments = check.arguments.model_validate_json(job.arguments)
     except (Exception, SystemExit) as exc:
         return outcome(
             error(
-                do=f"Preflight could not load {job.check_id} ({type(exc).__name__}).",
+                do=f"Preflight could not load {job.label} ({type(exc).__name__}).",
                 error_type=type(exc).__name__,
             )
         )
-    ctx = context_factory(
-        root=Path(job.root), environment=job.environment, identity=identity, identities=identities
-    )
+    values = {name: getattr(arguments, name) for name in type(arguments).model_fields}
+    identity = next((v for v in values.values() if isinstance(v, Identity)), None)
+    probe = probe_factory(root=Path(job.root), identity=identity)
     try:
-        data = _resolve_lazy(decode_data(job.data), ctx)
-    except _Unresolved as exc:
-        return outcome(error(do=str(exc), error_type="Unresolved"))
+        result = check.observe(probe, **values)
     except (Exception, SystemExit) as exc:
         return outcome(
             error(
                 do=(
-                    f"Could not read an SSM value for {job.check_id}; "
-                    "check the session, then rerun."
-                ),
-                error_type=type(exc).__name__,
-            )
-        )
-    try:
-        section = check.section.model_validate(data)
-    except ValidationError as exc:
-        fields = sorted({str(e["loc"][0]) for e in exc.errors() if e["loc"]})
-        return outcome(
-            error(
-                do=(
-                    f"After reading SSM, field(s) {', '.join(fields)} have the wrong shape; "
-                    "check the parameters they reference."
-                ),
-                error_type="ValidationError",
-            )
-        )
-    try:
-        result = check.observe(ctx, section)
-    except (Exception, SystemExit) as exc:
-        return outcome(
-            error(
-                do=(
-                    f"Could not observe {job.check_id}; "
+                    f"Could not observe {job.label}; "
                     "check credentials, network and tools, then rerun."
                 ),
                 error_type=type(exc).__name__,
@@ -162,7 +97,7 @@ def execute(job: Job, *, context_factory: Callable[..., Context] = Context) -> O
         return outcome(
             error(
                 do=(
-                    f"{job.check_id} returned {type(result).__name__}, not an Outcome; "
+                    f"{job.label} returned {type(result).__name__}, not an Outcome; "
                     "this is a bug in the check."
                 ),
                 error_type="TypeError",
@@ -220,15 +155,7 @@ def _reap(process: subprocess.Popen) -> None:
 def launch(
     job: Job, *, env: Mapping[str, str], timeout: float, python: str = sys.executable
 ) -> Outcome:
-    try:
-        payload = job.to_json()
-    except (TypeError, ValueError):
-        return outcome(
-            error(
-                do="The contract data for this check cannot be passed to a worker.",
-                error_type="TypeError",
-            )
-        )
+    payload = job.to_json()
     with _LIVE_LOCK:
         if _STOPPING:
             return _interrupted()
@@ -259,8 +186,8 @@ def launch(
             return outcome(
                 error(
                     do=(
-                        f"Timed out after {timeout:g} s; rerun, or raise this section's timeout "
-                        "if the probe is legitimately slow."
+                        f"Timed out after {timeout:g} s; rerun, or pass a larger timeout= to "
+                        "the check if the probe is legitimately slow."
                     ),
                     error_type="Timeout",
                 )
@@ -272,7 +199,7 @@ def launch(
         return outcome(
             error(
                 do=(
-                    f"The worker for {job.check_id} exited with status {process.returncode}; "
+                    f"The worker for {job.label} exited with status {process.returncode}; "
                     "rerun, and report it if it persists."
                 ),
                 error_type="WorkerCrashed",
@@ -284,7 +211,7 @@ def launch(
         return outcome(
             error(
                 do=(
-                    f"The worker for {job.check_id} produced unreadable output; "
+                    f"The worker for {job.label} produced unreadable output; "
                     "a check may be printing to stdout."
                 ),
                 error_type="WorkerOutput",

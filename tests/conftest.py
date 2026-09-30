@@ -15,13 +15,3 @@ def write(root: Path, relative: str, text: str) -> Path:
 def repo(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     return tmp_path.resolve()
-
-
-from preflight.gate import unload_consumer  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _fresh_consumer():
-    unload_consumer()
-    yield
-    unload_consumer()

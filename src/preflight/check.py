@@ -1,27 +1,21 @@
-"""Checks, their contract sections, and instances bound to a section or an identity."""
+"""Checks: functions whose calls are validated when made and observed later, in a worker."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Mapping
+import inspect
+import sys
+import types
+import typing
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, TypeVar
+from pathlib import Path
+from typing import Annotated, Any, TypeVar, get_type_hints
 
-from pydantic import (
-    AfterValidator,
-    BaseModel,
-    ConfigDict,
-    Field,
-    StringConstraints,
-    TypeAdapter,
-    ValidationError,
-)
+from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError, create_model
 
-from preflight.identity import Region
+from preflight.identity import Identity
 from preflight.outcome import Outcome
 
-Name = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$")]
-IdentityRef = Name
-Binds = Literal["section", "identity"]
 T = TypeVar("T")
 
 
@@ -47,132 +41,148 @@ unique = unique_by(lambda value: value)
 # A list whose entries must differ: `UniqueList[str]`.
 UniqueList = Annotated[list[T], AfterValidator(unique)]
 
-
-class Remedy(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    do: str | None = None
-    paste: str | None = None
-    wait: str | None = None
-    ref: str | None = None
+ARGUMENTS_CONFIG = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
-class Section(BaseModel):
-    """Base of every check's contract section. One model ignores keys it does not declare; the
-    graph refuses a key that no model bound to the section declares."""
+class CheckCallError(Exception):
+    """A check was called with arguments that do not fit its signature; nothing was observed."""
 
-    model_config = ConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
-
-    region: Region | None = None
-    timeout: float | None = Field(default=None, gt=0)
-    remedy: Remedy = Remedy()
+    def __init__(self, check_id: str, problems: list[str]):
+        self.check_id = check_id
+        self.problems = list(problems)
+        super().__init__(f"{check_id}: " + "; ".join(self.problems))
 
 
-class IdentitySection(Section):
-    identity: IdentityRef
+def _is_identity(annotation: Any) -> bool:
+    if annotation is Identity:
+        return True
+    origin = typing.get_origin(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return Identity in typing.get_args(annotation)
+    return False
 
 
-@dataclass(frozen=True)
-class Requirement:
-    """An intrinsic prerequisite: the `check_id` instance for the alias in section `field`."""
-
-    check_id: str
-    field: str
-
-
-def session_for(field: str) -> Requirement:
-    return Requirement("aws.session", field)
+def _module_label(module: str) -> str:
+    if module == "__main__":
+        file = getattr(sys.modules.get("__main__"), "__file__", None)
+        return Path(file).stem if file else "__main__"
+    return module.rsplit(".", 1)[-1]
 
 
 @dataclass(frozen=True)
 class Check:
     id: str
-    section: type[Section]
-    observe: Callable[[Any, Any], Outcome]
-    binds: Binds = "section"
-    requires: tuple[Requirement, ...] = ()
+    observe: Callable[..., Outcome]
+    arguments: type[BaseModel]
+    key: str | None = None
     timeout: float = 60.0
     # Run with the caller's AWS variables intact (only aws.assumed).
     ambient: bool = False
-    module: str = ""
 
-    def __call__(self, key: str) -> CheckInstance:
-        return CheckInstance(self, key)
+    @property
+    def module(self) -> str:
+        return self.observe.__module__
+
+    @property
+    def name(self) -> str:
+        return self.observe.__name__
+
+    @property
+    def file(self) -> str | None:
+        return inspect.getsourcefile(self.observe)
+
+    def __call__(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> BoundCheck:
+        try:
+            bound = inspect.signature(self.observe).bind(None, *args, **kwargs)
+        except TypeError as exc:
+            raise CheckCallError(self.id, [str(exc)]) from None
+        values = dict(bound.arguments)
+        values.pop(next(iter(values)))  # the probe, supplied by the worker
+        try:
+            arguments = self.arguments.model_validate(values)
+        except ValidationError as exc:
+            raise CheckCallError(
+                self.id,
+                [f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()],
+            ) from None
+        try:  # the worker receives the arguments as JSON; refuse now what it could not read
+            self.arguments.model_validate_json(arguments.model_dump_json())
+        except Exception:
+            raise CheckCallError(self.id, ["arguments must be JSON-serializable"]) from None
+        if timeout is not None and not timeout > 0:
+            raise CheckCallError(self.id, ["timeout: must be greater than 0"])
+        return BoundCheck(self, arguments, float(timeout) if timeout else self.timeout)
 
 
 @dataclass(frozen=True)
-class CheckInstance:
+class BoundCheck:
+    """A check with validated arguments, ready to run in a worker."""
+
     check: Check
-    key: str
+    arguments: BaseModel
+    timeout: float
 
     @property
-    def id(self) -> str:
-        return f"{self.check.id}[{self.key}]"
+    def values(self) -> dict[str, Any]:
+        return {name: getattr(self.arguments, name) for name in type(self.arguments).model_fields}
+
+    @property
+    def label(self) -> str:
+        if self.check.key is None:
+            return self.check.id
+        return f"{self.check.id}({getattr(self.arguments, self.check.key)})"
+
+    @property
+    def identity(self) -> Identity | None:
+        return next((v for v in self.values.values() if isinstance(v, Identity)), None)
+
+    def arguments_json(self) -> str:
+        return self.arguments.model_dump_json()
 
 
-REGISTRY: dict[str, Check] = {}
+def _arguments_model(fn: Callable[..., Outcome]) -> type[BaseModel]:
+    parameters = list(inspect.signature(fn).parameters.values())
+    if not parameters:
+        raise TypeError(f"{fn.__qualname__}: a check's first parameter is the probe")
+    hints = get_type_hints(fn, include_extras=True)
+    fields: dict[str, Any] = {}
+    for parameter in parameters[1:]:
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            star = "*" if parameter.kind is parameter.VAR_POSITIONAL else "**"
+            raise TypeError(f"{fn.__qualname__}: {star}{parameter.name} is not supported")
+        if parameter.name == "timeout":
+            raise TypeError(f"{fn.__qualname__}: timeout is reserved for every check call")
+        if parameter.name not in hints:
+            raise TypeError(
+                f"{fn.__qualname__}: parameter {parameter.name} needs a type annotation"
+            )
+        default = ... if parameter.default is inspect.Parameter.empty else parameter.default
+        fields[parameter.name] = (hints[parameter.name], default)
+    return create_model(f"{fn.__name__}_arguments", __config__=ARGUMENTS_CONFIG, **fields)
 
 
 def check(
-    check_id: str,
+    fn: Callable[..., Outcome] | None = None,
+    /,
     *,
-    section: type[Section] | None = None,
-    binds: Binds = "section",
-    requires: tuple[Requirement, ...] | list[Requirement] = (),
+    key: str | None = None,
     timeout: float = 60.0,
     ambient: bool = False,
-) -> Callable[[Callable[[Any, Any], Outcome]], Check]:
-    if binds == "identity":
-        model = section or IdentitySection
-        if not issubclass(model, IdentitySection):
-            raise ValueError(f"{check_id}: an identity-bound check's model extends IdentitySection")
-    elif section is None:
-        raise ValueError(f"{check_id}: a section-bound check needs a section model")
-    else:
-        model = section
+) -> Any:
+    """`@check` or `@check(key=..., timeout=..., ambient=...)` on a module-level function whose
+    first parameter is the probe and whose other parameters are annotated."""
 
-    def decorate(observe: Callable[[Any, Any], Outcome]) -> Check:
-        new = Check(
-            check_id, model, observe, binds, tuple(requires), timeout, ambient, observe.__module__
+    def decorate(fn: Callable[..., Outcome]) -> Check:
+        model = _arguments_model(fn)
+        if key is not None and key not in model.model_fields:
+            raise TypeError(f"{fn.__qualname__}: key {key} is not a parameter")
+        identities = [n for n, f in model.model_fields.items() if _is_identity(f.annotation)]
+        if len(identities) > 1:
+            raise TypeError(f"{fn.__qualname__}: a check takes at most one aws.Identity")
+        if fn.__qualname__ != fn.__name__:
+            raise TypeError(f"{fn.__qualname__}: define checks at module level for workers")
+        return Check(
+            f"{_module_label(fn.__module__)}.{fn.__name__}", fn, model, key, timeout, ambient
         )
-        existing = REGISTRY.get(check_id)
-        if existing is not None and (existing.module, existing.observe.__qualname__) != (
-            new.module,
-            observe.__qualname__,
-        ):
-            raise ValueError(f"check id {check_id!r} is already defined in {existing.module}")
-        REGISTRY[check_id] = new
-        return new
 
-    return decorate
-
-
-def _where(prefix: str, loc: tuple[Any, ...]) -> str:
-    return ".".join([prefix, *map(str, loc)]) if prefix else ".".join(map(str, loc))
-
-
-def field_problems(model: type[BaseModel], data: Mapping[str, Any], skip: set[str]) -> list[str]:
-    """Validate `data` against `model`, leaving out the fields in `skip` (placeholders and values
-    not known until run time). Whole-model validators run only when nothing is skipped."""
-    if not skip:
-        try:
-            model.model_validate(dict(data))
-        except ValidationError as exc:
-            return [f"{_where('', e['loc'])}: {e['msg']}" for e in exc.errors()]
-        return []
-    problems = []
-    for name, info in model.model_fields.items():
-        if name in skip:
-            continue
-        if name not in data:
-            if info.is_required():
-                problems.append(f"{name}: Field required")
-            continue
-        annotation = (
-            Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation
-        )
-        try:
-            TypeAdapter(annotation).validate_python(data[name])
-        except ValidationError as exc:
-            problems.extend(f"{_where(name, e['loc'])}: {e['msg']}" for e in exc.errors())
-    return problems
+    return decorate(fn) if fn is not None else decorate

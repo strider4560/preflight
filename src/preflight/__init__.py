@@ -1,18 +1,20 @@
-"""Operator guardrails: checks that stop a script and name the next step."""
+"""Operator guardrails: assertions a gate program runs before a script continues."""
 
-from preflight.check import (
+import sys
+
+# Gates import their own modules from the consumer's repository; leave no bytecode there.
+sys.dont_write_bytecode = True
+
+from preflight.check import (  # noqa: E402
+    BoundCheck,
     Check,
-    CheckInstance,
-    IdentityRef,
-    IdentitySection,
-    Name,
-    Requirement,
-    Section,
+    CheckCallError,
+    UniqueList,
     check,
-    session_for,
+    unique_by,
 )
-from preflight.gate import Gate
-from preflight.outcome import (
+from preflight.gate import Gate, Guards  # noqa: E402
+from preflight.outcome import (  # noqa: E402
     Item,
     NextStep,
     Outcome,
@@ -23,27 +25,33 @@ from preflight.outcome import (
     outcome,
     pending,
 )
+from preflight.params import Arg, Depends, Unmet  # noqa: E402
+from preflight.probe import Probe  # noqa: E402
+from preflight.runner import probe_now  # noqa: E402
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "Arg",
+    "BoundCheck",
     "Check",
-    "CheckInstance",
+    "CheckCallError",
+    "Depends",
     "Gate",
-    "IdentityRef",
-    "IdentitySection",
+    "Guards",
     "Item",
-    "Name",
     "NextStep",
     "Outcome",
-    "Requirement",
-    "Section",
+    "Probe",
     "Status",
+    "UniqueList",
+    "Unmet",
     "check",
     "error",
     "fail",
     "ok",
     "outcome",
     "pending",
-    "session_for",
+    "probe_now",
+    "unique_by",
 ]

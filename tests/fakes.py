@@ -4,8 +4,10 @@ import json
 import shlex
 from dataclasses import dataclass
 
-from preflight.context import Context
+from preflight.check import BoundCheck
 from preflight.identity import Identity
+from preflight.outcome import Outcome
+from preflight.probe import Probe
 
 IDENTITY = Identity(
     profile="sandbox",
@@ -97,16 +99,17 @@ class FakeDns:
         return self._answer(self.caa_records.get(name, []))
 
 
-def make_ctx(
-    root, *, host=None, ansible=None, dns=None, identity=IDENTITY, environ=None, environment="dev"
-):
-    return Context(
+def make_probe(root, *, host=None, ansible=None, dns=None, identity=IDENTITY, environ=None):
+    return Probe(
         root=root,
-        environment=environment,
         identity=identity,
-        identities={"admin": identity} if identity else {},
         environ=environ if environ is not None else {},
         _host=host,
         _ansible_host=ansible,
         _dns=dns,
     )
+
+
+def observe(bound: BoundCheck, probe: Probe) -> Outcome:
+    """Runs a bound check's function in process, with the arguments its call validated."""
+    return bound.check.observe(probe, **bound.values)
