@@ -223,13 +223,13 @@ The checks and their observation code carry over; their inputs become arguments.
 |---|---|---|
 | `aws.assumed` | `identity` | The caller's own shell acts as the identity (ambient) |
 | `aws.region` | `identity` | The profile's configured region is the identity's |
-| `ssm.parameters_exist` | `names`, `identity` | Each parameter exists and is non-empty, read without decryption; a `SecureString` is an error. Replaces `ssm.present` and `ssm.parameters`. A missing one: "SSM parameter /platform/state/bucket does not exist in account 711387098919 (us-east-1). Publish it from the stack that owns it", with `aws ssm get-parameter` to confirm afterwards |
+| `ssm.parameters_exist` | `names`, `identity` | Each parameter exists and is non-empty, read without decryption. Replaces `ssm.present` and `ssm.parameters`. A missing one: "SSM parameter /platform/state/bucket does not exist in account 711387098919 (us-east-1). Publish it from the stack that owns it", with `aws ssm get-parameter` to confirm afterwards |
 | `acm.issued` | `arn`, `identity` | Issued; or the exact validation CNAME to add; or waiting |
 | `tofu.plan_clean` | `dir`, `var_files`, `identity` | `tofu plan -detailed-exitcode` is 0, read-only; refuses a directory holding `backend.tf.off` or `terraform.tfstate` |
 | `dns.delegated` | `root`, `name_servers` (zone prefix → servers) | The parent's own servers delegate exactly those servers |
 | `dns.undelegated` | `root`, `zones` | The parent gives no referral |
 | `dns.cname`, `dns.caa` | their former section fields | Records the operator adds by hand |
-| `github.auth`, `repo`, `variables`, `environments`, `ruleset`, `secret_names`, `workflow_green` | their former section fields | GitHub settings; secrets by name only |
+| `github.auth`, `repo`, `variables`, `org_variables`, `environments`, `ruleset`, `secret_names`, `workflow_green` | their former section fields; `variables` takes `repo` and `org_variables` takes `org`, replacing the section's either-or rule | GitHub settings; secrets by name only |
 | `git.up_to_date` | `remote="origin"`, `branch="main"` | The checkout contains the remote branch's latest commit, without fetching |
 | `files.present`, `absent`, `git_ignored`, `committed` | `paths` | Existence and git status only |
 | `sops.rule` | its former section fields | A creation rule with enough age recipients covers each secrets file |
@@ -243,7 +243,7 @@ The checks and their observation code carry over; their inputs become arguments.
 - It parses the command line and resolves every provider every guard needs, so the consumer's own reading runs: a renamed tfvars key or a moved file fails here.
 - `probe_now` returns a stand-in `ok` outcome without starting a worker, so `aws.signed_in` yields its identity unverified.
 - It calls every guard function, which validates every check's arguments.
-- It exits 0, or 2 for a gate error. No worker starts.
+- It exits 0, or 2 for a gate error; a provider of the gate's own that raises `Unmet` still stops it with 1. No worker starts.
 
 A gate whose guards depend on observed values (an `ssm.value` provider, later) validates with stand-ins for those values; the gate's author decides whether that is meaningful.
 
@@ -278,15 +278,17 @@ The library's own tests stay offline:
 | `gate.py` | `Gate`, `Guards`, guard registration, `include`, `run()` |
 | `params.py` | `Arg`, `Depends`, command-line parsing, dependency resolution and caching, `Unmet` |
 | `check.py` | `@check`, bound checks, ids and keys |
-| `probe.py` | `Probe` (formerly `context.py`), `probe_now` |
+| `probe.py` | `Probe` (formerly `context.py`) |
+| `runner.py` | Executors (workers, `--validate` stand-ins, test stand-ins) and `probe_now` |
+| `identity.py` | The `aws.Identity` model and matching rules, and each worker's environment; `catalog/aws.py` re-exports `Identity`, its public name |
 | `worker.py` | Runs one bound check in its own process |
 | `outcome.py` | `Outcome`, items, `NextStep` (without `generic`), `ok`/`fail`/`pending`/`error` |
 | `render.py` | The terminal worklist |
 | `testing.py` | `GateClient` |
 | `dnsclient.py` | Unchanged |
-| `catalog/` | The catalog above; `aws.Identity` and `aws.signed_in` in `catalog/aws.py` |
+| `catalog/` | The catalog above; `aws.signed_in` in `catalog/aws.py` |
 
-Removed: `cli.py` and the `preflight` console script, `contract.py`, `resolvers.py`, `graph.py`, the graph-based `runner.py`, `identity.py` (its rules move to `aws.Identity`), JSON and JUnit rendering, and the `python-hcl2` dependency. PyYAML stays for `sops.rule`. The README is rewritten around the gate program.
+Removed: `cli.py` and the `preflight` console script, `contract.py`, `resolvers.py`, `graph.py`, the graph-based runner, the identity aliases, JSON and JUnit rendering, and the `python-hcl2` dependency. PyYAML stays for `sops.rule`. The README is rewritten around the gate program.
 
 ## Release
 
