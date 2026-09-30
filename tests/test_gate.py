@@ -9,8 +9,9 @@ from preflight import gate as gate_module
 from preflight.check import check
 from preflight.gate import Gate, Guards
 from preflight.outcome import Outcome, fail, ok, outcome
-from preflight.params import Arg, Depends, Unmet
+from preflight.params import Arg, Depends, Unmet, observed
 from preflight.probe import Probe
+from preflight.runner import probe_now
 
 Env = Annotated[Literal["dev", "prod"], Arg()]
 
@@ -477,6 +478,31 @@ def test_run_resolves_providers_on_demand_and_reports_unmet(tmp_path, capsys):
     assert exc.value.code == 1
     out = capsys.readouterr().out
     assert "needs signed" in out and "aws sso login" in out
+
+
+def test_an_unmet_raised_in_the_block_is_a_worklist_and_exits_1(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    looks = Scripted({"test_gate.thing(x)": outcome(fail(do="Could not look."))})
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=looks, root=tmp_path):
+            observed(probe_now(thing(name="x")))
+            log.append("unreachable")
+    assert exc.value.code == 1
+    assert log == ["enter", "exit"]
+    captured = capsys.readouterr()
+    assert "needs the program" in captured.out and "Could not look." in captured.out
+    assert "raised" not in captured.err
+
+
+def test_probe_now_works_inside_the_block(tmp_path):
+    answer = outcome(ok(observed="present"))
+    executor = Scripted({"test_gate.thing(x)": answer})
+    gate = Gate("program")
+    gate.guard("ready")(lambda: [thing(name="r")])
+    with gate.checked([], executor=executor, root=tmp_path):
+        assert probe_now(thing(name="x")) is answer
+    assert executor.ran == ["test_gate.thing(r)", "test_gate.thing(x)"]
 
 
 def test_a_cleanup_failure_after_a_passing_block_exits_3(tmp_path, capsys):

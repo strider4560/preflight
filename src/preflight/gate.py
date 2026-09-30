@@ -138,6 +138,9 @@ class Gate(Guards):
             passing = exc
         except Propagate:
             raise
+        except Unmet as exc:  # the block's own observed(), as run[provider] reports one
+            _emit(_unmet(prepared.base, exc, exc.provider or "the program"))
+            code = 1
         except Exception as exc:
             kill_all()
             code = 2
@@ -348,8 +351,7 @@ class Run:
             return self._session.resolver.provide(provider)
         except Unmet as exc:
             name = exc.provider or getattr(provider, "__name__", "provider")
-            guard = GuardResult(f"needs {name}", unmet=exc.items, unmet_by=name)
-            _emit(_finish(replace(self._prepared.base, exit_code=1, guards=(guard,))))
+            _emit(_unmet(self._prepared.base, exc, name))
             raise SystemExit(1) from None
         except ProviderFailed as exc:
             print(f"{self._gate._prog()}: {exc}", file=sys.stderr)
@@ -421,6 +423,12 @@ def _labels(checks: Sequence[BoundCheck]) -> list[str]:
         else:
             labels.append(bound.label)
     return labels
+
+
+def _unmet(base: RunResult, exc: Unmet, name: str) -> RunResult:
+    """A worklist of one guard, `needs <name>`, carrying the unmet steps (exit 1)."""
+    guard = GuardResult(f"needs {name}", unmet=exc.items, unmet_by=name)
+    return _finish(replace(base, exit_code=1, guards=(guard,)))
 
 
 def _finish(result: RunResult) -> RunResult:
