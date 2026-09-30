@@ -122,6 +122,7 @@ class Gate(Guards):
         session = _Session(self, prepared.values, prepared.executor)
         session.open()
         code = 0
+        passing: SystemExit | None = None  # held until cleanup, which may turn it into 3
         try:
             result = _finish(session.run_guards(prepared.base, prepared.guards, _progress))
             _emit(result)
@@ -131,7 +132,11 @@ class Gate(Guards):
         except KeyboardInterrupt:
             kill_all()
             code = 130
-        except (SystemExit, Propagate):
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                raise
+            passing = exc
+        except Propagate:
             raise
         except Exception as exc:
             kill_all()
@@ -145,6 +150,8 @@ class Gate(Guards):
             code = 3
         if code:
             raise SystemExit(code)
+        if passing is not None:
+            raise passing  # re-raised, not returned: contextlib would swallow a return
 
     def execute(
         self,
@@ -331,7 +338,7 @@ class Run:
     """The scope of a passed gate: its arguments, its providers, and verification afterwards."""
 
     def __init__(self, gate: Gate, session: _Session, prepared: _Prepared):
-        self.gate = gate
+        self._gate = gate
         self._session = session
         self._prepared = prepared
         self.args: Mapping[str, Any] = MappingProxyType(dict(prepared.values))
@@ -345,12 +352,18 @@ class Run:
             _emit(_finish(replace(self._prepared.base, exit_code=1, guards=(guard,))))
             raise SystemExit(1) from None
         except ProviderFailed as exc:
-            print(f"{self.gate._prog()}: {exc}", file=sys.stderr)
+            print(f"{self._gate._prog()}: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
 
     def verify(self, guards: Guards) -> None:
         """Runs more guards in this scope; exits when one stops, returns when every one passed."""
-        flat = _unique_guards(guards, self.gate.name)
+        flat = _unique_guards(guards, self._gate.name)
+        specs = collect_args([g.fn for g in flat], self._gate.dependency_overrides)
+        unknown = [spec.name for spec in specs if spec.name not in self.args]
+        if unknown:
+            raise GateDefinitionError(
+                [f"verify: argument {name} is not an argument of the gate" for name in unknown]
+            )
         result = _finish(self._session.run_guards(self._prepared.base, flat, _progress))
         _emit(result)
         if result.exit_code != 0:

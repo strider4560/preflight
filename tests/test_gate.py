@@ -530,3 +530,85 @@ def test_an_interrupt_during_cleanup_exits_130(tmp_path):
         with gate.checked([], executor=Scripted(), root=tmp_path):
             pass
     assert exc.value.code == 130
+
+
+def cleanup_fails_gate():
+    def session() -> Iterator[str]:
+        yield "s"
+        raise RuntimeError("secret")
+
+    gate = Gate("program")
+
+    @gate.guard("ready")
+    def ready(s: Annotated[str, Depends(session)]):
+        return [thing(name=s)]
+
+    return gate
+
+
+def test_a_passing_exit_from_the_block_still_exits_3_when_cleanup_fails(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        with cleanup_fails_gate().checked([], executor=Scripted(), root=tmp_path):
+            sys.exit(0)
+    assert exc.value.code == 3
+    assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
+
+
+def test_validate_still_exits_3_when_cleanup_fails(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        with cleanup_fails_gate().checked(["--validate"], executor=Scripted(), root=tmp_path):
+            pytest.fail("the block ran under --validate")
+    assert exc.value.code == 3
+    assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
+
+
+def test_a_passing_exit_from_the_block_with_clean_cleanup_exits_0(tmp_path):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            sys.exit(0)
+    assert exc.value.code == 0
+    assert log == ["enter", "exit"]
+
+
+def test_a_nonzero_system_exit_from_the_block_keeps_its_code_and_cleans_up(tmp_path):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            raise SystemExit(4)
+    assert exc.value.code == 4
+    assert log == ["enter", "exit"]
+
+
+def test_verify_with_an_argument_the_gate_lacks_is_the_programs_failure(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    after = Guards()
+
+    @after.guard("extra")
+    def extra(extra: Annotated[str, Arg()]):
+        return [thing(name=extra)]
+
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path) as run:
+            run.verify(after)
+    assert exc.value.code == 2
+    assert log == ["enter", "exit"]
+    assert "the program raised GateDefinitionError" in capsys.readouterr().err
+
+
+def test_a_provider_that_raises_in_the_block_exits_2_with_its_type_only(tmp_path, capsys):
+    def broken() -> str:
+        raise KeyError("secret")
+
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path) as run:
+            run[broken]
+    assert exc.value.code == 2
+    assert log == ["enter", "exit"]
+    err = capsys.readouterr().err
+    assert "provider broken raised KeyError" in err and "secret" not in err
