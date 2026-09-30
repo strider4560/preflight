@@ -33,7 +33,7 @@ def test_bucket_status(tmp_path, host, status, observed):
     bound = s3.bucket_status(bucket="tellabs-tfstate-dev", identity=IDENTITY)
     item = observe(bound, make_probe(tmp_path, host=host)).items[0]
     assert (item.status, item.observed) == (status, observed)
-    assert "--bucket tellabs-tfstate-dev" in host.commands[0]
+    assert "--bucket tellabs-tfstate-dev --region us-east-1" in host.commands[0]
     assert bound.label == "s3.bucket_status(tellabs-tfstate-dev)"
 
 
@@ -48,15 +48,16 @@ def test_bucket_status_error_steps(tmp_path):
 
 
 def test_object_exists(tmp_path):
-    present = FakeAnsibleHost({"amazon.aws.s3_object": {"s3_keys": ["platform/bootstrap.tfstate"]}})
+    present = FakeAnsibleHost(
+        {"amazon.aws.s3_object_info": {"s3_keys": ["platform/bootstrap.tfstate"]}}
+    )
     bound = s3.object_exists(bucket="bkt", key="platform/bootstrap.tfstate", identity=IDENTITY)
     assert observe(bound, make_probe(tmp_path, ansible=present)).items[0].observed is True
     assert present.calls == [
         (
-            "amazon.aws.s3_object",
+            "amazon.aws.s3_object_info",
             {
-                "bucket": "bkt",
-                "mode": "list",
+                "bucket_name": "bkt",
                 "prefix": "platform/bootstrap.tfstate",
                 "max_keys": 1,
                 "region": "us-east-1",
@@ -64,14 +65,14 @@ def test_object_exists(tmp_path):
             },
         )
     ]
-    absent = FakeAnsibleHost({"amazon.aws.s3_object": {"s3_keys": []}})
+    absent = FakeAnsibleHost({"amazon.aws.s3_object_info": {"s3_keys": []}})
     assert observe(bound, make_probe(tmp_path, ansible=absent)).items[0].observed is False
     sibling = FakeAnsibleHost(
-        {"amazon.aws.s3_object": {"s3_keys": ["platform/bootstrap.tfstate.backup"]}}
+        {"amazon.aws.s3_object_info": {"s3_keys": ["platform/bootstrap.tfstate.backup"]}}
     )
     assert observe(bound, make_probe(tmp_path, ansible=sibling)).items[0].observed is False
     failing = FakeAnsibleHost(
-        {"amazon.aws.s3_object": AnsibleException({"failed": True, "msg": "SECRET"})}
+        {"amazon.aws.s3_object_info": AnsibleException({"failed": True, "msg": "SECRET"})}
     )
     item = observe(bound, make_probe(tmp_path, ansible=failing)).items[0]
     assert (item.status, item.error_type) == (Status.ERROR, "AnsibleException")
@@ -81,3 +82,8 @@ def test_object_exists(tmp_path):
 def test_bucket_names_are_validated():
     with pytest.raises(CheckCallError, match="bucket"):
         s3.bucket_status(bucket="Not A Bucket", identity=IDENTITY)
+
+
+def test_an_empty_object_key_is_refused():
+    with pytest.raises(CheckCallError, match="key"):
+        s3.object_exists(bucket="bkt", key="", identity=IDENTITY)

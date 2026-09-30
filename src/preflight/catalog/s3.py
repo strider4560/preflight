@@ -13,6 +13,7 @@ from preflight.outcome import Outcome, error, ok, outcome
 from preflight.probe import Probe
 
 BucketName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")]
+ObjectKey = Annotated[str, StringConstraints(min_length=1)]
 
 
 @check(key="bucket")
@@ -42,11 +43,13 @@ def bucket_status(probe: Probe, bucket: BucketName, identity: Identity) -> Outco
 
 
 @check(key="key")
-def object_exists(probe: Probe, bucket: BucketName, key: str, identity: Identity) -> Outcome:
+def object_exists(probe: Probe, bucket: BucketName, key: ObjectKey, identity: Identity) -> Outcome:
+    """True or False. Keys list in lexical order, so the first key under the prefix `key` is
+    `key` itself when it exists; a missing bucket fails the module and is an error."""
     try:
         listing = probe.aws_module(
-            "amazon.aws.s3_object",
-            {"bucket": bucket, "mode": "list", "prefix": key, "max_keys": 1},
+            "amazon.aws.s3_object_info",
+            {"bucket_name": bucket, "prefix": key, "max_keys": 1},
             expect=("s3_keys",),
         )
     except Exception as exc:
