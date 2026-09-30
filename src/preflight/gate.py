@@ -79,7 +79,10 @@ class Gate(Guards):
         def progress(name: str) -> None:
             print(f"… {name}", file=sys.stderr, flush=True)
 
-        result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
+        try:
+            result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
         sys.stdout.write(result.output)
         sys.stdout.flush()
         raise SystemExit(result.exit_code)
@@ -164,13 +167,13 @@ class Gate(Guards):
             exit_code = 130
             problems.append("interrupted")
         except Propagate:
-            stack.close()
             raise
         except Exception as exc:
             kill_all()
             exit_code = 3
             problems.append(f"preflight failed ({type(exc).__name__})")
-        stack.close()
+        finally:
+            stack.close()
         problems.extend(resolver.cleanup_problems)
         if resolver.cleanup_problems and exit_code == 0:
             exit_code = 3
@@ -195,7 +198,7 @@ class Gate(Guards):
             checks = guard.fn(**kwargs)
         except CheckCallError as exc:
             return None, f"guard {guard.name!r}: {exc}"
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             return None, f"guard {guard.name!r} raised {type(exc).__name__}"
         if (
             not isinstance(checks, list)

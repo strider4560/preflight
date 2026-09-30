@@ -248,7 +248,7 @@ class Resolver:
             raise
         except (ProviderFailed, Propagate):
             raise
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             raise ProviderFailed(name, type(exc).__name__) from None
         self.cache[provider] = value
         return value
@@ -259,7 +259,7 @@ class Resolver:
         def leave(*_exc_info: Any) -> bool:
             try:
                 manager.__exit__(None, None, None)
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 self.cleanup_problems.append(f"provider {name} cleanup raised {type(exc).__name__}")
             return False
 

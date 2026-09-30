@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Annotated, Literal
@@ -266,3 +267,55 @@ def test_the_gate_knows_its_file_and_run_exits_with_the_code(tmp_path, capsys, m
         gate.run(["dev"])
     assert exc.value.code == 0
     assert capsys.readouterr().out.endswith("Every guard passed.\n")
+
+
+def test_a_sys_exit_in_a_guard_is_a_gate_error_and_cleanup_still_runs(tmp_path):
+    log = []
+
+    def session() -> Iterator[str]:
+        log.append("enter")
+        yield "s"
+        log.append("exit")
+
+    gate = Gate("g")
+
+    @gate.guard("uses session")
+    def first(s: Annotated[str, Depends(session)]):
+        return [thing(name="1")]
+
+    @gate.guard("exits")
+    def exits():
+        sys.exit(0)
+
+    result = run(gate, argv=(), tmp=tmp_path)
+    assert result.exit_code == 2
+    assert "guard 'exits' raised SystemExit" in result.problems
+    assert log == ["enter", "exit"]
+
+
+def test_a_sys_exit_in_a_provider_is_a_gate_error(tmp_path):
+    def quitter() -> str:
+        sys.exit(0)
+
+    gate = Gate("g")
+
+    @gate.guard("needs it")
+    def needs(x: Annotated[str, Depends(quitter)]):
+        return [thing(name=x)]
+
+    result = run(gate, argv=(), tmp=tmp_path)
+    assert result.exit_code == 2
+    assert result.problems == ("guard 'needs it': provider quitter raised SystemExit",)
+
+
+def test_run_exits_130_when_interrupted_outside_the_guard_loop(capsys, monkeypatch):
+    gate = three_guards()
+
+    def interrupted(argv, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gate, "execute", interrupted)
+    with pytest.raises(SystemExit) as exc:
+        gate.run(["dev"])
+    assert exc.value.code == 130
+    assert capsys.readouterr().out == ""
