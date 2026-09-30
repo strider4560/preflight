@@ -60,9 +60,10 @@ A gate is an executable Python file in the consumer's repository. Its PEP 723 he
 # ///
 """Bootstrap is applied: its parameters are published and stacks/bootstrap plans clean."""
 
-import iac
 from preflight import Gate
 from preflight.catalog import ssm, tofu
+
+import iac
 
 gate = Gate("bootstrap")
 gate.include(iac.ids_filled)
@@ -102,6 +103,7 @@ uv run "$root/preflight/bootstrap_entry.py" "$env" || exit 1
 - `@gate.guard(name)` registers a guard. Guard names are unique within a gate, including included guards; a repeat is a gate error.
 - A guard function returns a list of bound checks (below). It is called only when its turn comes, after its dependencies are resolved. Returning anything else, or an empty list, is a gate error.
 - `Guards()` is a router: `shared = Guards()`, `@shared.guard(...)`. `gate.include(shared)` places its guards where the call appears, in their declaration order. This is how two gates share guards.
+- Import `preflight` before the gate's own modules (`iac` above): importing it stops Python writing bytecode, so none is written into the consumer's repository.
 
 ### A run
 
@@ -188,6 +190,7 @@ PROFILES = {"dev": "sandbox", "prod": "production"}
 
 
 def admin(env: Env) -> Iterator[aws.Identity]:
+    # relative to the gate file's repository root (ROOT, from Path(__file__)), not the working directory
     tf = tfvars(f"envs/{env}.tfvars")
     with aws.signed_in(
         profile=PROFILES[env],
