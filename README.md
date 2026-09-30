@@ -111,7 +111,9 @@ never refuses on.
 Interrupts (Ctrl-C, SIGTERM, SIGHUP) arrive in the block as `KeyboardInterrupt`. A child the
 program runs with `subprocess.run` is SIGKILLed 0.25 s after it, so a child that needs a clean
 shutdown (tofu holding a state lock) runs under `subprocess.Popen`: on `KeyboardInterrupt`,
-keep waiting for the child (Ctrl-C at a terminal already sent it SIGINT), then re-raise.
+keep waiting for the child (Ctrl-C at a terminal already sent it SIGINT), then re-raise. A
+SIGTERM or SIGHUP sent to the program alone never reaches the child, so wait a grace period
+and, if the child is still running, send it SIGINT yourself before waiting again.
 
 ## Your own checks
 
