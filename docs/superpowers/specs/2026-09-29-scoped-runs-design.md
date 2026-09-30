@@ -31,7 +31,8 @@ if __name__ == "__main__":
 - Leaving the block, however it ends, runs the providers' cleanup in reverse order, as at the end of `run()`. A cleanup that raises is printed to stderr and turns a passing exit into 3.
   - A `SystemExit` from the block (a `verify` that stopped, or the program's own) propagates with its code.
   - Ctrl-C, SIGTERM or SIGHUP kill every live worker and exit 130.
-  - Any other exception from the block is the program's own failure: `<prog>: the program raised <Type>` on stderr, exit 2, the type only.
+  - An `Unmet` raised in the block itself (an `observed` the program calls) prints its steps as a one-guard worklist, `needs the program`, and exits 1.
+  - Any other exception from the block is the program's own failure: `<prog>: the program raised <Type>` on stderr, exit 2, the type only. A `GateDefinitionError` (such as `run.verify` given a guard whose argument the gate lacks) prints its problems instead, which name arguments and guards, never values.
 
 `run()` is unchanged in behavior and shares the same run loop, so a gate that is only a gate keeps working.
 
@@ -44,7 +45,7 @@ A provider that needs facts rather than a verdict reads them from a check's outc
 | `s3.bucket_status` | `bucket`, `identity` | `"present"`, `"absent"` or `"forbidden"` (403: the name belongs to another account). No Ansible module distinguishes 403 from 404, so this check runs `aws s3api head-bucket` through `probe.host.run` and reads the status code from its stderr; the message itself never leaves the worker |
 | `s3.object_exists` | `bucket`, `key`, `identity` | `True` or `False`, through `amazon.aws.s3_object_info` |
 
-A helper, `preflight.observed(outcome, key=None)`, returns the observed value of an `ok` item and raises `Unmet(outcome)` when the item is not ok, so a provider can write `status = observed(probe_now(s3.bucket_status(bucket, identity=identity)))`.
+A helper, `preflight.observed(outcome, key=None)`, returns the observed value of an `ok` item and raises `Unmet(outcome)` when the item is not ok, so a provider can write `status = observed(probe_now(s3.bucket_status(bucket, identity=identity)))`. Under `--validate` nothing is observed: every item's observed value is `preflight.NOT_OBSERVED` (a `str`), and `observed` returns it for any key. A provider treats it as unknown, never as present or absent, and never refuses on it.
 
 ## iac's bootstrap as a program
 
@@ -58,7 +59,7 @@ A helper, `preflight.observed(outcome, key=None)`, returns the observed value of
 
 ## Release
 
-`checked`, `Run`, `observed` and the `s3` checks are new public API: `v0.2.0`. iac pins it.
+`checked`, `Run`, `observed`, `NOT_OBSERVED` and the `s3` checks are new public API: `v0.2.0`. iac pins it.
 
 ## Acceptance
 
