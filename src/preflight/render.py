@@ -66,14 +66,17 @@ def _step_lines(step: NextStep) -> list[str]:
 
 
 def _open(guard: GuardResult) -> list[str]:
-    groups: dict[tuple[Status, NextStep], list[str]] = {}
+    groups: dict[tuple[Status, NextStep], list[tuple[str, Item]]] = {}
     for label, item in guard.labelled_items():
         if item.status is Status.OK or item.advisory:
             continue
-        groups.setdefault((item.status, item.next_step or NO_NEXT_STEP), []).append(label)
+        groups.setdefault((item.status, item.next_step or NO_NEXT_STEP), []).append((label, item))
     lines: list[str] = []
-    for (status, step), labels in groups.items():
-        lines.append(f"{DETAIL}{LABELS[status]:<7} {', '.join(labels)}")
+    for (status, step), members in groups.items():
+        labels = ", ".join(label for label, _ in members)
+        error_type = members[0][1].error_type if status is Status.ERROR else None
+        suffix = f" ({error_type})" if error_type else ""
+        lines.append(f"{DETAIL}{LABELS[status]:<7} {labels}{suffix}")
         lines.extend(_step_lines(step))
     lines.extend(
         f"{DETAIL}{'ok':<7} {label}"

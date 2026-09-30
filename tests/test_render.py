@@ -71,6 +71,22 @@ def test_unmet_items_show_under_the_guard_with_their_provider():
     assert "      ERROR   needs admin\n              Sign in to profile sandbox.\n" in text
 
 
+def test_an_error_names_its_type_after_the_labels():
+    step = {"do": "Install the GitHub CLI (gh).", "error_type": "MissingTool"}
+    guard = GuardResult(
+        "repository ready",
+        (
+            CheckResult("github.variables", outcome(error(**step))),
+            CheckResult("github.secrets", outcome(error(**step))),
+        ),
+    )
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert (
+        "      ERROR   github.variables, github.secrets (MissingTool)\n"
+        "              Install the GitHub CLI (gh).\n"
+    ) in text
+
+
 def test_wait_ref_and_warnings():
     guard = GuardResult(
         "delegated",
