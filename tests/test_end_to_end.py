@@ -111,10 +111,11 @@ def setup(repo):
     return write(repo, "gate/ready.py", GATE)
 
 
-def run(gate_file, *args, cwd):
+def run(gate_file, *args, cwd, env=None):
     return subprocess.run(
         [sys.executable, str(gate_file), *args],
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         timeout=180,
@@ -167,7 +168,10 @@ def test_validate_observes_nothing(repo):
 
 def test_no_bytecode_is_left_in_the_repository(repo):
     gate = setup(repo)
-    run(gate, "dev", cwd=repo)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    result = run(gate, "dev", cwd=repo, env=env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (repo / "gate" / "__pycache__").exists()
     assert list(repo.rglob("__pycache__")) == []
 
 
