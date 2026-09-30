@@ -144,6 +144,7 @@ class Gate(Guards):
         problems: list[str] = []
         exit_code = 0
         attempted = 0
+        current: str | None = None  # the guard being attempted, named if it is cut short
         reset_stop()
         stack = contextlib.ExitStack()
         resolver = Resolver(values, self.dependency_overrides, stack)
@@ -151,9 +152,11 @@ class Gate(Guards):
             with using(executor):
                 for guard in guards:
                     attempted += 1
+                    current = guard.name
                     if progress:
                         progress(guard.name)
                     result, problem = self._guard(guard, resolver, executor)
+                    current = None
                     if problem is not None:
                         problems.append(problem)
                         exit_code = 2
@@ -165,13 +168,14 @@ class Gate(Guards):
         except KeyboardInterrupt:
             kill_all()
             exit_code = 130
-            problems.append("interrupted")
+            problems.append(f"interrupted during guard {current!r}" if current else "interrupted")
         except Propagate:
             raise
         except Exception as exc:
             kill_all()
             exit_code = 3
-            problems.append(f"preflight failed ({type(exc).__name__})")
+            where = f" in guard {current!r}" if current else ""
+            problems.append(f"preflight failed{where} ({type(exc).__name__})")
         finally:
             stack.close()
         problems.extend(resolver.cleanup_problems)

@@ -249,6 +249,8 @@ def test_an_interrupt_kills_workers_cleans_up_and_exits_130(tmp_path, monkeypatc
     assert result.exit_code == 130
     assert killed == [True]
     assert log == ["enter", "exit"]
+    assert result.problems == ("interrupted during guard 'uses session'",)
+    assert result.not_run == ("second",)
     assert "Every guard passed" not in result.output
 
 
@@ -256,7 +258,8 @@ def test_an_unexpected_executor_failure_is_a_preflight_bug(tmp_path):
     executor = Scripted(raise_on="test_gate.thing(dev-1)", exc=RuntimeError("secret"))
     result = run(three_guards(), executor=executor, tmp=tmp_path)
     assert result.exit_code == 3
-    assert result.problems == ("preflight failed (RuntimeError)",)
+    assert result.problems == ("preflight failed in guard 'first' (RuntimeError)",)
+    assert result.not_run == ("second", "third")
 
 
 def test_validate_observes_nothing_and_exits_0(tmp_path):
