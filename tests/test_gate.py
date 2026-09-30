@@ -184,6 +184,17 @@ def test_provider_and_guard_exceptions_report_only_their_type(tmp_path):
     assert result.problems == ("guard 'needs admin': provider admin raised KeyError",)
     assert "123456789012" not in result.output
 
+    broken = Gate("g")
+
+    @broken.guard("looks up")
+    def looks_up():
+        raise KeyError("123456789012")
+
+    result = run(broken, argv=(), tmp=tmp_path)
+    assert result.exit_code == 2
+    assert result.problems == ("guard 'looks up' raised KeyError",)
+    assert "123456789012" not in result.output
+
 
 def test_unmet_stops_the_run_with_the_providers_steps(tmp_path):
     def admin() -> str:
