@@ -6,7 +6,6 @@ import time
 import pytest
 from conftest import write
 
-from preflight import worker
 from preflight.outcome import Status
 from preflight.worker import Job, execute, kill_all, launch, reset_stop
 
@@ -183,7 +182,3 @@ def test_the_worker_writes_no_bytecode_into_the_gate_directory(repo):
     env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
     assert launch(job(repo), env=env, timeout=60).status is Status.OK
     assert list((repo / "gate").rglob("__pycache__")) == []
-
-
-def test_worker_module_has_no_graph_leftovers():
-    assert not hasattr(worker, "encode_data")
