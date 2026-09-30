@@ -29,7 +29,7 @@ from preflight.params import Arg, Depends, Unmet, observed  # noqa: E402
 from preflight.probe import Probe  # noqa: E402
 from preflight.runner import probe_now  # noqa: E402
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Arg",

@@ -134,6 +134,8 @@ value in an item. Define checks at module level, in the gate file or a module be
 | `aws.region` | `identity` | The profile's configured region |
 | `aws.session` | `identity` | Preflight can observe as the identity (used by `aws.signed_in`) |
 | `ssm.parameters_exist` | `names`, `identity` | Each parameter exists and is non-empty (read without decryption) |
+| `s3.bucket_status` | `bucket`, `identity` | Observes `present`, `absent` or `forbidden` (another account owns the name) |
+| `s3.object_exists` | `bucket`, `key`, `identity` | Observes whether the object exists |
 | `acm.issued` | `arn`, `identity` | Issued; or the exact validation CNAME to add; or waiting |
 | `tofu.plan_clean` | `dir`, `var_files`, `identity` | `tofu plan -detailed-exitcode` is 0 (no lock, read-only) |
 | `dns.delegated` | `root`, `name_servers` | The parent zone's own servers delegate exactly those servers |
@@ -145,7 +147,7 @@ value in an item. Define checks at module level, in the gate file or a module be
 | `sops.rule` | `paths`, `min_recipients`, `config` | A creation rule with enough age recipients covers each file |
 
 Checks shell out to these tools, each needed only by the checks that use it: the `aws` CLI
-(`aws.region`), `tofu` (`tofu.plan_clean`), `gh` 2.48 or newer (`github.*`), and `git`
+(`aws.region`, `s3.bucket_status`), `tofu` (`tofu.plan_clean`), `gh` 2.48 or newer (`github.*`), and `git`
 (`git.*`, `files.git_ignored`, `files.committed`; a gate must live in a git work tree).
 
 ## Running a gate

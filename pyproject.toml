@@ -1,6 +1,6 @@
 [project]
 name = "preflight"
-version = "0.1.0"
+version = "0.2.0"
 description = "Operator guardrails: gate programs that stop a script and name the next step"
 readme = "README.md"
 requires-python = ">=3.12"
