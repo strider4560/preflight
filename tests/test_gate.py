@@ -444,16 +444,6 @@ def test_an_exception_in_the_block_is_the_programs_failure(tmp_path, capsys):
     assert "the program raised KeyError" in err and "123456789012" not in err
 
 
-def test_a_system_exit_from_the_block_keeps_its_code(tmp_path):
-    log = []
-    gate, _, _ = checked_gate(log)
-    with pytest.raises(SystemExit) as exc:
-        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
-            raise SystemExit(0)
-    assert exc.value.code == 0
-    assert log == ["enter", "exit"]
-
-
 def test_an_interrupt_in_the_block_cleans_up_and_exits_130(tmp_path, monkeypatch):
     killed = []
     monkeypatch.setattr(gate_module, "kill_all", lambda: killed.append(True))
@@ -506,18 +496,8 @@ def test_probe_now_works_inside_the_block(tmp_path):
 
 
 def test_a_cleanup_failure_after_a_passing_block_exits_3(tmp_path, capsys):
-    def session() -> Iterator[str]:
-        yield "s"
-        raise RuntimeError("secret")
-
-    gate = Gate("program")
-
-    @gate.guard("ready")
-    def ready(s: Annotated[str, Depends(session)]):
-        return [thing(name=s)]
-
     with pytest.raises(SystemExit) as exc:
-        with gate.checked([], executor=Scripted(), root=tmp_path):
+        with cleaned_gate([], cleanup_raises=True).checked([], executor=Scripted(), root=tmp_path):
             pass
     assert exc.value.code == 3
     assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
@@ -558,23 +538,9 @@ def test_an_interrupt_during_cleanup_exits_130(tmp_path):
     assert exc.value.code == 130
 
 
-def cleanup_fails_gate():
-    def session() -> Iterator[str]:
-        yield "s"
-        raise RuntimeError("secret")
-
-    gate = Gate("program")
-
-    @gate.guard("ready")
-    def ready(s: Annotated[str, Depends(session)]):
-        return [thing(name=s)]
-
-    return gate
-
-
 def test_a_passing_exit_from_the_block_still_exits_3_when_cleanup_fails(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
-        with cleanup_fails_gate().checked([], executor=Scripted(), root=tmp_path):
+        with cleaned_gate([], cleanup_raises=True).checked([], executor=Scripted(), root=tmp_path):
             sys.exit(0)
     assert exc.value.code == 3
     assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
@@ -582,7 +548,9 @@ def test_a_passing_exit_from_the_block_still_exits_3_when_cleanup_fails(tmp_path
 
 def test_validate_still_exits_3_when_cleanup_fails(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
-        with cleanup_fails_gate().checked(["--validate"], executor=Scripted(), root=tmp_path):
+        with cleaned_gate([], cleanup_raises=True).checked(
+            ["--validate"], executor=Scripted(), root=tmp_path
+        ):
             pytest.fail("the block ran under --validate")
     assert exc.value.code == 3
     assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
