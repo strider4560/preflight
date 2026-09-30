@@ -55,7 +55,7 @@ class RunResult:
 
 
 def _step_lines(step: NextStep) -> list[str]:
-    lines = [STEP + step.do]
+    lines = [STEP + line for line in step.do.splitlines()]
     if step.paste:
         lines.extend(STEP + "  " + line for line in step.paste.splitlines())
     if step.wait:

@@ -1,5 +1,5 @@
-from preflight.outcome import error, fail, ok, outcome
-from preflight.render import CheckResult, GuardResult, RunResult, worklist
+from preflight.outcome import Item, Status, error, fail, ok, outcome, pending
+from preflight.render import NO_NEXT_STEP, CheckResult, GuardResult, RunResult, worklist
 
 ASSUMED = CheckResult(
     "aws.assumed",
@@ -103,3 +103,49 @@ def test_stopped_at_is_the_first_guard_that_did_not_pass():
     bad = GuardResult("two", (CheckResult("c", outcome(fail(do="x"))),))
     assert RunResult("g", guards=(good, bad)).stopped_at == "two"
     assert RunResult("g", guards=(good,)).stopped_at is None
+
+
+def test_multi_line_do_indents_every_line():
+    guard = GuardResult("g1", (CheckResult("c", outcome(fail(do="First line.\nSecond line."))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert f"\n{' ' * 14}First line.\n{' ' * 14}Second line.\n" in text
+
+
+def test_pending_item_shows_status_column_and_wait():
+    guard = GuardResult("g1", (CheckResult("cache", outcome(pending(wait="5 minutes"))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert "      pending cache\n" in text
+    assert "              wait: 5 minutes\n" in text
+
+
+def test_item_without_next_step_renders_the_placeholder():
+    guard = GuardResult("g1", (CheckResult("c", outcome(Item("k", Status.FAIL))),))
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert f"      FAIL    c:k\n              {NO_NEXT_STEP.do}\n" in text
+
+
+def test_unmet_items_come_before_check_items():
+    guard = GuardResult(
+        "g1",
+        (CheckResult("c", outcome(fail(do="Check step."))),),
+        unmet=(error(do="Unmet step."),),
+        unmet_by="admin",
+    )
+    labels = [label for label, _ in guard.labelled_items()]
+    assert labels == ["needs admin", "c"]
+    text = worklist(RunResult("g", exit_code=1, guards=(guard,)))
+    assert text.index("needs admin") < text.index("      FAIL    c")
+
+
+def test_advisory_only_guard_passes_and_warns():
+    guard = GuardResult(
+        "g1", (CheckResult("c", outcome(fail(do="Consider this.", advisory=True))),)
+    )
+    assert guard.passed
+    text = worklist(RunResult("g", guards=(guard,)))
+    assert "  ✓ g1\n" in text
+    assert "Warnings:\n  ! c  Consider this.\n" in text
+
+
+def test_no_guards_and_exit_zero_passes():
+    assert worklist(RunResult("g")) == "preflight g\n\n\nEvery guard passed.\n"
