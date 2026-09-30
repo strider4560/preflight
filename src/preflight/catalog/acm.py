@@ -5,14 +5,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from preflight.check import IdentityRef, Section, check, session_for
+from preflight.check import check
 from preflight.dnsclient import DnsUnavailable, norm
+from preflight.identity import Identity
 from preflight.outcome import Outcome, error, fail, ok, outcome, pending
-
-
-class CertificateSection(Section):
-    identity: IdentityRef
-    certificate_arn: str
+from preflight.probe import Probe
 
 
 def _validation_records(certificate: dict[str, Any]) -> list[dict[str, str]]:
@@ -24,12 +21,12 @@ def _validation_records(certificate: dict[str, Any]) -> list[dict[str, str]]:
     return list(records.values())
 
 
-@check("acm.issued", section=CertificateSection, requires=[session_for("identity")])
-def issued(ctx, s: CertificateSection) -> Outcome:
+@check(key="arn")
+def issued(probe: Probe, arn: str, identity: Identity) -> Outcome:
     try:
-        info = ctx.aws_module(
+        info = probe.aws_module(
             "community.aws.acm_certificate_info",
-            {"certificate_arn": s.certificate_arn},
+            {"certificate_arn": arn},
             expect=("certificates",),
         )
     except Exception as exc:
@@ -37,7 +34,7 @@ def issued(ctx, s: CertificateSection) -> Outcome:
             error(
                 do=(
                     "Could not describe the certificate; check that profile "
-                    f"{ctx.identity.profile} may call acm:DescribeCertificate."
+                    f"{identity.profile} may call acm:DescribeCertificate."
                 ),
                 error_type=type(exc).__name__,
             )
@@ -46,8 +43,7 @@ def issued(ctx, s: CertificateSection) -> Outcome:
     if not certificates:
         return outcome(
             fail(
-                do=f"No certificate {s.certificate_arn} exists in {ctx.identity.region}.",
-                generic=True,
+                do=f"No certificate {arn} exists in {identity.region}.",
             )
         )
     status = certificates[0].get("status", "UNKNOWN")
@@ -58,7 +54,6 @@ def issued(ctx, s: CertificateSection) -> Outcome:
             fail(
                 do=f"The certificate is {status}; request a new one.",
                 observed=status,
-                generic=True,
             )
         )
     records = _validation_records(certificates[0])
@@ -67,7 +62,7 @@ def issued(ctx, s: CertificateSection) -> Outcome:
             pending(wait="ACM has not published the validation record yet; recheck in a minute.")
         )
     try:
-        missing = [r for r in records if norm(r["value"]) not in ctx.dns.cname(r["name"])]
+        missing = [r for r in records if norm(r["value"]) not in probe.dns.cname(r["name"])]
     except DnsUnavailable:
         return outcome(
             error(
@@ -81,7 +76,6 @@ def issued(ctx, s: CertificateSection) -> Outcome:
                 do="Add the certificate's validation record(s) in the zone that holds them:",
                 paste="\n".join(f"{norm(r['name'])}. CNAME {norm(r['value'])}." for r in missing),
                 observed=status,
-                generic=True,
             )
         )
     return outcome(

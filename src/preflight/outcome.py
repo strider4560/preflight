@@ -1,10 +1,9 @@
-# src/preflight/outcome.py
 """What one observation produced: statuses, items, and the operator's next step."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -14,11 +13,10 @@ class Status(StrEnum):
     FAIL = "fail"
     PENDING = "pending"
     ERROR = "error"
-    BLOCKED = "blocked"
 
 
 # Worst first: an outcome takes the worst status among its blocking items.
-SEVERITY = (Status.ERROR, Status.BLOCKED, Status.FAIL, Status.PENDING, Status.OK)
+SEVERITY = (Status.ERROR, Status.FAIL, Status.PENDING, Status.OK)
 
 
 @dataclass(frozen=True)
@@ -27,27 +25,13 @@ class NextStep:
     paste: str | None = None
     wait: str | None = None
     ref: str | None = None
-    # True when `do` is a default that the section's remedy may replace.
-    generic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "do": self.do,
-            "paste": self.paste,
-            "wait": self.wait,
-            "ref": self.ref,
-            "generic": self.generic,
-        }
+        return {"do": self.do, "paste": self.paste, "wait": self.wait, "ref": self.ref}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> NextStep:
-        return cls(
-            data["do"],
-            data.get("paste"),
-            data.get("wait"),
-            data.get("ref"),
-            data.get("generic", False),
-        )
+        return cls(data["do"], data.get("paste"), data.get("wait"), data.get("ref"))
 
 
 @dataclass(frozen=True)
@@ -130,9 +114,8 @@ def fail(
     ref: str | None = None,
     observed: Any = None,
     advisory: bool = False,
-    generic: bool = False,
 ) -> Item:
-    return Item(key, Status.FAIL, observed, NextStep(do, paste, wait, ref, generic), advisory)
+    return Item(key, Status.FAIL, observed, NextStep(do, paste, wait, ref), advisory)
 
 
 def pending(
@@ -157,31 +140,5 @@ def error(
     error_type: str | None = None,
     observed: Any = None,
     advisory: bool = False,
-    generic: bool = False,
 ) -> Item:
-    return Item(
-        key, Status.ERROR, observed, NextStep(do, paste, None, ref, generic), advisory, error_type
-    )
-
-
-def apply_remedy(result: Outcome, remedy: Mapping[str, str], values: Mapping[str, Any]) -> Outcome:
-    """Merge a section's remedy over every non-ok item: `paste`, `wait` and `ref` fill fields the
-    check left empty; `do` replaces the check's text only where the check marked it generic."""
-    if not remedy:
-        return result
-    rendered = {name: text.format_map(values) for name, text in remedy.items() if text}
-    items = []
-    for item in result.items:
-        step = item.next_step
-        if item.status is Status.OK or step is None:
-            items.append(item)
-            continue
-        changes = {
-            name: rendered[name]
-            for name in ("paste", "wait", "ref")
-            if name in rendered and getattr(step, name) is None
-        }
-        if "do" in rendered and step.generic:
-            changes["do"] = rendered["do"]
-        items.append(replace(item, next_step=replace(step, **changes)))
-    return Outcome(tuple(items))
+    return Item(key, Status.ERROR, observed, NextStep(do, paste, None, ref), advisory, error_type)

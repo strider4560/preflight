@@ -7,46 +7,43 @@ from typing import Annotated
 
 from pydantic import Field, StringConstraints
 
-from preflight.check import IdentityRef, Section, UniqueList, check, session_for
+from preflight.check import UniqueList, check
+from preflight.identity import Identity
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
+from preflight.probe import Probe
 
 SsmName = Annotated[str, StringConstraints(pattern=r"^/[A-Za-z0-9_.\-/]+$")]
+Names = Annotated[UniqueList[SsmName], Field(min_length=1)]
 
 
-class PresentSection(Section):
-    identity: IdentityRef
-    name: SsmName
-    how: str | None = None
-
-
-class ParametersSection(Section):
-    identity: IdentityRef
-    names: UniqueList[SsmName] = Field(min_length=1)
-    how: str | None = None
-
-
-def _observe(ctx, name: str, how: str | None, key: str | None) -> Item:
+def _observe(probe: Probe, identity: Identity, name: str) -> Item:
     try:
-        value = ctx.ssm_lookup(name)
+        value = probe.ssm_lookup(name)
     except Exception as exc:
         return error(
-            key,
+            name,
             do=(
                 f"Could not read {name}; "
-                f"check that profile {ctx.identity.profile} may call ssm:GetParameter."
+                f"check that profile {identity.profile} may call ssm:GetParameter."
             ),
             error_type=type(exc).__name__,
         )
     if value:
-        return ok(key)
-    return fail(key, do=f"SSM parameter {name} is missing or empty.", paste=how, generic=True)
+        return ok(name)
+    return fail(
+        name,
+        do=(
+            f"SSM parameter {name} does not exist in account {identity.account_id} "
+            f"({identity.region}), or is empty. Publish it from the stack that owns it, "
+            "then confirm:"
+        ),
+        paste=(
+            f"aws ssm get-parameter --name {name} --profile {identity.profile} "
+            f"--region {identity.region} --query Parameter.Name --output text"
+        ),
+    )
 
 
-@check("ssm.present", section=PresentSection, requires=[session_for("identity")])
-def present(ctx, s: PresentSection) -> Outcome:
-    return outcome(_observe(ctx, s.name, s.how, None))
-
-
-@check("ssm.parameters", section=ParametersSection, requires=[session_for("identity")])
-def parameters(ctx, s: ParametersSection) -> Outcome:
-    return outcome(*(_observe(ctx, name, s.how, name) for name in s.names))
+@check
+def parameters_exist(probe: Probe, names: Names, identity: Identity) -> Outcome:
+    return outcome(*(_observe(probe, identity, name) for name in names))

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import shlex
-from typing import Annotated, Any, Self
+from typing import Annotated, Any
 from urllib.parse import quote
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints
 
-from preflight.check import Section, UniqueList, check
+from preflight.check import UniqueList, check
 from preflight.outcome import Item, Outcome, error, fail, ok, outcome
+from preflight.probe import Probe
 
 Repo = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")]
 Owner = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]+$")]
@@ -50,8 +51,8 @@ def _classify(rc: int, stderr: str) -> GhError:
     return GhError(f"gh api exited {rc}")
 
 
-def _gh_api(ctx, command: str, path: str) -> Any:
-    result = ctx.host.run(command, path)
+def _gh_api(probe: Probe, command: str, path: str) -> Any:
+    result = probe.host.run(command, path)
     if result.rc == 0:
         text = result.stdout.strip()
         try:
@@ -63,13 +64,13 @@ def _gh_api(ctx, command: str, path: str) -> Any:
     raise _classify(result.rc, result.stderr)
 
 
-def gh_api(ctx, path: str) -> Any:
-    return _gh_api(ctx, "gh api %s", path)
+def gh_api(probe: Probe, path: str) -> Any:
+    return _gh_api(probe, "gh api %s", path)
 
 
-def gh_api_pages(ctx, path: str) -> list:
+def gh_api_pages(probe: Probe, path: str) -> list:
     """Every page of a list endpoint, as the list of page bodies."""
-    return _list(_gh_api(ctx, "gh api --paginate --slurp %s", path))
+    return _list(_gh_api(probe, "gh api --paginate --slurp %s", path))
 
 
 def _dict(body: Any) -> dict:
@@ -117,67 +118,58 @@ def _all(items: list[Item]) -> Outcome:
     return outcome(*items) if items else outcome(ok(observed="nothing to check"))
 
 
-class AuthSection(Section):
-    hostname: str = "github.com"
-
-
-@check("github.auth", section=AuthSection)
-def auth(ctx, s: AuthSection) -> Outcome:
-    result = ctx.host.run("gh auth status --hostname %s", s.hostname)
+@check
+def auth(probe: Probe, hostname: str = "github.com") -> Outcome:
+    result = probe.host.run("gh auth status --hostname %s", hostname)
     if result.rc == 127:
         return outcome(error(do="Install the GitHub CLI (gh).", error_type="MissingTool"))
     if result.rc == 0:
         return outcome(ok())
     return outcome(
         error(
-            do=f"Sign in to {s.hostname} with the GitHub CLI.",
+            do=f"Sign in to {hostname} with the GitHub CLI.",
             paste="gh auth login",
             error_type="GhAuth",
         )
     )
 
 
-class RepoSection(Section):
-    repo: Repo
-    actions_access: str | None = None
-
-
-@check("github.repo", section=RepoSection)
-def repo(ctx, s: RepoSection) -> Outcome:
+@check(key="repo")
+def repo(probe: Probe, repo: Repo, actions_access: str | None = None) -> Outcome:
     try:
-        gh_api(ctx, f"repos/{s.repo}")
+        gh_api(probe, f"repos/{repo}")
     except GhNotFound:
         return outcome(
             fail(
                 "exists",
-                do=(f"Create the repository {s.repo}, or correct its name in the contract{SEE}"),
-                paste=f"gh repo create {shlex.quote(s.repo)} --private",
+                do=f"Create the repository {repo}, or correct its name in the gate{SEE}",
+                paste=f"gh repo create {shlex.quote(repo)} --private",
             )
         )
     except GhError as exc:
         return outcome(_gh_error("exists", exc))
     items = [ok("exists")]
-    if s.actions_access is not None:
+    if actions_access is not None:
         try:
-            body = gh_api(ctx, f"repos/{s.repo}/actions/permissions/access")
+            body = gh_api(probe, f"repos/{repo}/actions/permissions/access")
             access = _dict(body).get("access_level")
         except GhError as exc:
             items.append(_gh_error("actions_access", exc))
         else:
-            if access == s.actions_access:
+            if access == actions_access:
                 items.append(ok("actions_access", observed=access))
             else:
-                endpoint = shlex.quote(f"repos/{s.repo}/actions/permissions/access")
+                endpoint = shlex.quote(f"repos/{repo}/actions/permissions/access")
                 items.append(
                     fail(
                         "actions_access",
                         do=(
-                            f"Set Actions access for {s.repo} to {s.actions_access} "
+                            f"Set Actions access for {repo} to {actions_access} "
                             "(Settings → Actions → General → Access)."
                         ),
                         paste=(
                             f"gh api -X PUT {endpoint} "
-                            f"-f access_level={shlex.quote(s.actions_access)}"
+                            f"-f access_level={shlex.quote(actions_access)}"
                         ),
                         observed=access,
                     )
@@ -185,29 +177,12 @@ def repo(ctx, s: RepoSection) -> Outcome:
     return outcome(*items)
 
 
-class VariablesSection(Section):
-    repo: Repo | None = None
-    org: Owner | None = None
-    variables: dict[Name, str]
-
-    @model_validator(mode="after")
-    def one_owner(self) -> Self:
-        if (self.repo is None) == (self.org is None):
-            raise ValueError("give exactly one of repo or org")
-        return self
-
-
-@check("github.variables", section=VariablesSection)
-def variables(ctx, s: VariablesSection) -> Outcome:
-    if s.org:
-        base, flag = f"orgs/{s.org}", f"--org {shlex.quote(s.org)}"
-    else:
-        base, flag = f"repos/{s.repo}", f"--repo {shlex.quote(s.repo or '')}"
+def _variables(probe: Probe, base: str, flag: str, variables: dict[str, str]) -> Outcome:
     items = []
-    for name, expected in s.variables.items():
+    for name, expected in variables.items():
         paste = f"gh variable set {shlex.quote(name)} {flag} --body {shlex.quote(expected)}"
         try:
-            value = _dict(gh_api(ctx, f"{base}/actions/variables/{name}")).get("value")
+            value = _dict(gh_api(probe, f"{base}/actions/variables/{name}")).get("value")
         except GhNotFound:
             items.append(fail(name, do=f"Create the Actions variable {name}.", paste=paste))
             continue
@@ -228,23 +203,30 @@ def variables(ctx, s: VariablesSection) -> Outcome:
     return _all(items)
 
 
-class EnvironmentsSection(Section):
-    repo: Repo
-    environments: UniqueList[EnvName] = Field(min_length=1)
+@check(key="repo")
+def variables(probe: Probe, repo: Repo, variables: dict[Name, str]) -> Outcome:
+    return _variables(probe, f"repos/{repo}", f"--repo {shlex.quote(repo)}", variables)
 
 
-@check("github.environments", section=EnvironmentsSection)
-def environments(ctx, s: EnvironmentsSection) -> Outcome:
+@check(key="org")
+def org_variables(probe: Probe, org: Owner, variables: dict[Name, str]) -> Outcome:
+    return _variables(probe, f"orgs/{org}", f"--org {shlex.quote(org)}", variables)
+
+
+@check(key="repo")
+def environments(
+    probe: Probe, repo: Repo, environments: Annotated[UniqueList[EnvName], Field(min_length=1)]
+) -> Outcome:
     items = []
-    for name in s.environments:
-        endpoint = f"repos/{s.repo}/environments/{quote(name)}"
+    for name in environments:
+        endpoint = f"repos/{repo}/environments/{quote(name)}"
         try:
-            gh_api(ctx, endpoint)
+            gh_api(probe, endpoint)
         except GhNotFound:
             items.append(
                 fail(
                     name,
-                    do=f"Create the GitHub environment {name} in {s.repo}.",
+                    do=f"Create the GitHub environment {name} in {repo}.",
                     paste=f"gh api -X PUT {shlex.quote(endpoint)}",
                 )
             )
@@ -255,41 +237,38 @@ def environments(ctx, s: EnvironmentsSection) -> Outcome:
     return outcome(*items)
 
 
-class RulesetSection(Section):
-    repo: Repo
-    name: str
-    required_checks: list[str] = []
-    enforcement: str = "active"
-
-
-@check("github.ruleset", section=RulesetSection)
-def ruleset(ctx, s: RulesetSection) -> Outcome:
-    where = f"Settings → Rules → Rulesets in {s.repo}"
+@check(key="name")
+def ruleset(
+    probe: Probe,
+    repo: Repo,
+    name: str,
+    required_checks: tuple[str, ...] = (),
+    enforcement: str = "active",
+) -> Outcome:
+    where = f"Settings → Rules → Rulesets in {repo}"
     try:
         summaries = [
-            _dict(r) for page in gh_api_pages(ctx, f"repos/{s.repo}/rulesets") for r in _list(page)
+            _dict(r) for page in gh_api_pages(probe, f"repos/{repo}/rulesets") for r in _list(page)
         ]
-        match = next((r for r in summaries if r.get("name") == s.name), None)
+        match = next((r for r in summaries if r.get("name") == name), None)
         if match is None:
-            return outcome(
-                fail("exists", do=f"Create the ruleset {s.name!r} ({where}).", generic=True)
-            )
-        detail = _dict(gh_api(ctx, f"repos/{s.repo}/rulesets/{match['id']}"))
+            return outcome(fail("exists", do=f"Create the ruleset {name!r} ({where})."))
+        detail = _dict(gh_api(probe, f"repos/{repo}/rulesets/{match['id']}"))
     except GhError as exc:
         return outcome(_gh_error("exists", exc))
     items = [ok("exists")]
-    enforcement = detail.get("enforcement")
-    if enforcement == s.enforcement:
-        items.append(ok("enforcement", observed=enforcement))
+    actual = detail.get("enforcement")
+    if actual == enforcement:
+        items.append(ok("enforcement", observed=actual))
     else:
         items.append(
             fail(
                 "enforcement",
-                do=f"Set ruleset {s.name!r} enforcement to {s.enforcement} ({where}).",
-                observed=enforcement,
+                do=f"Set ruleset {name!r} enforcement to {enforcement} ({where}).",
+                observed=actual,
             )
         )
-    if s.required_checks:
+    if required_checks:
         try:
             contexts = {
                 check_.get("context")
@@ -303,14 +282,14 @@ def ruleset(ctx, s: RulesetSection) -> Outcome:
         except GhError as exc:
             items.append(_gh_error("required_checks", exc))
             return outcome(*items)
-        missing = [c for c in s.required_checks if c not in contexts]
+        missing = [c for c in required_checks if c not in contexts]
         if missing:
             items.append(
                 fail(
                     "required_checks",
                     do=(
                         f"Add the required status check(s) {', '.join(missing)} to ruleset "
-                        f"{s.name!r} ({where})."
+                        f"{name!r} ({where})."
                     ),
                     observed=sorted(contexts),
                 )
@@ -320,24 +299,23 @@ def ruleset(ctx, s: RulesetSection) -> Outcome:
     return outcome(*items)
 
 
-class SecretNamesSection(Section):
-    repo: Repo
-    environment: EnvName | None = None
-    names: UniqueList[Name] = Field(min_length=1)
-
-
-@check("github.secret_names", section=SecretNamesSection)
-def secret_names(ctx, s: SecretNamesSection) -> Outcome:
-    if s.environment:
-        path = f"repos/{s.repo}/environments/{quote(s.environment)}/secrets"
-        where, flag = f" on environment {s.environment}", f" --env {shlex.quote(s.environment)}"
+@check(key="repo")
+def secret_names(
+    probe: Probe,
+    repo: Repo,
+    names: Annotated[UniqueList[Name], Field(min_length=1)],
+    environment: EnvName | None = None,
+) -> Outcome:
+    if environment:
+        path = f"repos/{repo}/environments/{quote(environment)}/secrets"
+        where, flag = f" on environment {environment}", f" --env {shlex.quote(environment)}"
     else:
-        path, where, flag = f"repos/{s.repo}/actions/secrets", "", ""
+        path, where, flag = f"repos/{repo}/actions/secrets", "", ""
     ending = "."
     try:
         present = {
             _dict(x).get("name")
-            for page in gh_api_pages(ctx, path)
+            for page in gh_api_pages(probe, path)
             for x in _list(_dict(page).get("secrets"))
         }
     except GhNotFound:
@@ -351,47 +329,39 @@ def secret_names(ctx, s: SecretNamesSection) -> Outcome:
             else fail(
                 name,
                 do=f"Set the secret {name}{where}{ending}",
-                paste=f"gh secret set {shlex.quote(name)}{flag} --repo {shlex.quote(s.repo)}",
+                paste=f"gh secret set {shlex.quote(name)}{flag} --repo {shlex.quote(repo)}",
             )
-            for name in s.names
+            for name in names
         )
     )
 
 
-class WorkflowSection(Section):
-    repo: Repo
-    workflow: str
-    branch: str | None = None
-    event: str | None = None
-
-
-@check("github.workflow_green", section=WorkflowSection)
-def workflow_green(ctx, s: WorkflowSection) -> Outcome:
+@check(key="workflow")
+def workflow_green(
+    probe: Probe, repo: Repo, workflow: str, branch: str | None = None, event: str | None = None
+) -> Outcome:
     query = "per_page=1&status=completed"
-    if s.branch:
-        query += f"&branch={quote(s.branch)}"
-    if s.event:
-        query += f"&event={quote(s.event)}"
+    if branch:
+        query += f"&branch={quote(branch)}"
+    if event:
+        query += f"&event={quote(event)}"
     try:
-        body = gh_api(ctx, f"repos/{s.repo}/actions/workflows/{quote(s.workflow)}/runs?{query}")
+        body = gh_api(probe, f"repos/{repo}/actions/workflows/{quote(workflow)}/runs?{query}")
         runs = _list(_dict(body).get("workflow_runs"))
         last = _dict(runs[0]) if runs else None
     except GhError as exc:
         return outcome(_gh_error(None, exc))
     if last is None:
-        return outcome(
-            fail(do=f"{s.workflow} has no completed run yet; trigger one.", generic=True)
-        )
+        return outcome(fail(do=f"{workflow} has no completed run yet; trigger one."))
     if last.get("conclusion") == "success":
         return outcome(ok(observed=last.get("html_url")))
     return outcome(
         fail(
             do=(
-                f"The last {s.workflow} run concluded {last.get('conclusion')}; open it, fix the "
+                f"The last {workflow} run concluded {last.get('conclusion')}; open it, fix the "
                 "cause, and rerun."
             ),
             paste=last.get("html_url"),
             observed=last.get("conclusion"),
-            generic=True,
         )
     )

@@ -1,17 +1,6 @@
-"""Operator guardrails: checks that stop a script and name the next step."""
+"""Operator guardrails: assertions a gate program runs before a script continues."""
 
-from preflight.check import (
-    Check,
-    CheckInstance,
-    IdentityRef,
-    IdentitySection,
-    Name,
-    Requirement,
-    Section,
-    check,
-    session_for,
-)
-from preflight.gate import Gate
+from preflight.check import BoundCheck, Check, CheckCallError, UniqueList, check, unique_by
 from preflight.outcome import (
     Item,
     NextStep,
@@ -23,27 +12,25 @@ from preflight.outcome import (
     outcome,
     pending,
 )
+from preflight.probe import Probe
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "BoundCheck",
     "Check",
-    "CheckInstance",
-    "Gate",
-    "IdentityRef",
-    "IdentitySection",
+    "CheckCallError",
     "Item",
-    "Name",
     "NextStep",
     "Outcome",
-    "Requirement",
-    "Section",
+    "Probe",
     "Status",
+    "UniqueList",
     "check",
     "error",
     "fail",
     "ok",
     "outcome",
     "pending",
-    "session_for",
+    "unique_by",
 ]

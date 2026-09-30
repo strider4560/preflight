@@ -1,7 +1,7 @@
 [project]
 name = "preflight"
 version = "0.1.0"
-description = "Operator guardrails: checks that stop a script and name the next step"
+description = "Operator guardrails: gate programs that stop a script and name the next step"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,12 +10,8 @@ dependencies = [
   "dnspython>=2.7,<3",
   "pydantic>=2.11,<3",
   "pytest-testinfra>=10,<11",
-  "python-hcl2>=8,<9",
   "PyYAML>=6,<7",
 ]
-
-[project.scripts]
-preflight = "preflight.cli:main"
 
 [build-system]
 requires = ["hatchling"]

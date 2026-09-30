@@ -51,11 +51,9 @@ def make_ansible_host() -> Any:
 
 
 @dataclass
-class Context:
+class Probe:
     root: Path
-    environment: str | None = None
     identity: Identity | None = None
-    identities: Mapping[str, Identity] = field(default_factory=dict)
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     _host: Any = None
     _ansible_host: Any = None
@@ -82,22 +80,20 @@ class Context:
     def path(self, relative: str) -> Path:
         return self.root / relative
 
-    def _identity(self, identity: Identity | None) -> Identity:
-        chosen = identity or self.identity
-        if chosen is None:
+    def _identity(self) -> Identity:
+        if self.identity is None:
             raise RuntimeError("this check has no identity")
-        return chosen
+        return self.identity
 
     def aws_module(
         self,
         module: str,
         args: Mapping[str, Any] | None = None,
         *,
-        identity: Identity | None = None,
         ambient: bool = False,
         expect: tuple[str, ...],
     ) -> dict[str, Any]:
-        chosen = self._identity(identity)
+        chosen = self._identity()
         payload = {**(args or {}), "region": chosen.region}
         if not ambient:
             payload["profile"] = chosen.profile
@@ -111,8 +107,8 @@ class Context:
             raise ModuleFailed(module)
         return result
 
-    def ssm_lookup(self, name: str, *, identity: Identity | None = None) -> str | None:
-        chosen = self._identity(identity)
+    def ssm_lookup(self, name: str) -> str | None:
+        chosen = self._identity()
         expression = (
             "{{ lookup('amazon.aws.ssm_parameter', "
             + _literal(name)

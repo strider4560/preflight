@@ -1,8 +1,8 @@
 import pytest
-from fakes import FakeDns, make_ctx
-from pydantic import ValidationError
+from fakes import FakeDns, make_probe, observe
 
 from preflight.catalog import dns
+from preflight.check import CheckCallError
 from preflight.dnsclient import DnsUnavailable, Referral
 from preflight.outcome import Status
 
@@ -10,13 +10,13 @@ SERVERS = ["ns-2.example.", "ns-1.example."]
 
 
 def delegation(zones=("app",), servers=None):
-    return dns.DelegationSection(
-        root="tellabs.dev", zones=list(zones), name_servers={"app": servers or SERVERS}
+    return dns.delegated(
+        root="tellabs.dev", name_servers={z: list(servers or SERVERS) for z in zones}
     )
 
 
-def run(check, section, tmp_path, fake):
-    return check.observe(make_ctx(tmp_path, dns=fake), section)
+def run(bound, tmp_path, fake):
+    return observe(bound, make_probe(tmp_path, dns=fake))
 
 
 def test_delegated_exactly(tmp_path):
@@ -25,7 +25,7 @@ def test_delegated_exactly(tmp_path):
             "app.tellabs.dev": Referral("referral", frozenset({"ns-1.example", "ns-2.example"}))
         }
     )
-    assert run(dns.delegated, delegation(), tmp_path, fake).status is Status.OK
+    assert run(delegation(), tmp_path, fake).status is Status.OK
 
 
 def test_a_stale_extra_server_fails_with_the_exact_block(tmp_path):
@@ -36,7 +36,7 @@ def test_a_stale_extra_server_fails_with_the_exact_block(tmp_path):
             )
         }
     )
-    item = run(dns.delegated, delegation(), tmp_path, fake).items[0]
+    item = run(delegation(), tmp_path, fake).items[0]
     assert item.key == "app"
     assert item.status is Status.FAIL
     assert (
@@ -53,23 +53,21 @@ def test_no_delegation_and_no_zone_and_unavailable(tmp_path):
             "api.tellabs.dev": DnsUnavailable("x"),
         }
     )
-    section = dns.DelegationSection(
-        root="tellabs.dev",
-        zones=["app", "api", "new"],
-        name_servers={"app": SERVERS, "api": SERVERS},
+    bound = dns.delegated(
+        root="tellabs.dev", name_servers={"app": SERVERS, "api": SERVERS, "new": []}
     )
-    items = {i.key: i for i in run(dns.delegated, section, tmp_path, fake).items}
+    items = {i.key: i for i in run(bound, tmp_path, fake).items}
     assert items["app"].status is Status.FAIL
     assert items["api"].status is Status.ERROR
-    assert (items["new"].status, items["new"].next_step.generic) == (Status.FAIL, True)
+    assert items["new"].status is Status.FAIL
 
 
 def test_no_zones_is_ok(tmp_path):
-    assert run(dns.delegated, delegation(zones=()), tmp_path, FakeDns()).status is Status.OK
+    assert run(delegation(zones=()), tmp_path, FakeDns()).status is Status.OK
 
 
 def test_undelegated(tmp_path):
-    section = dns.UndelegatedSection(root="tellabs.dev", zones=["old", "gone", "lame"])
+    bound = dns.undelegated(root="tellabs.dev", zones=["old", "gone", "lame"])
     fake = FakeDns(
         referrals={
             "old.tellabs.dev": Referral("referral", frozenset({"ns-1.example"})),
@@ -77,21 +75,21 @@ def test_undelegated(tmp_path):
             "lame.tellabs.dev": DnsUnavailable("SERVFAIL"),
         }
     )
-    items = {i.key: i for i in run(dns.undelegated, section, tmp_path, fake).items}
+    items = {i.key: i for i in run(bound, tmp_path, fake).items}
     assert items["old"].status is Status.FAIL
     assert items["gone"].status is Status.OK
     assert items["lame"].status is Status.ERROR  # never ok when nothing answered
 
 
 def test_cname_with_an_advisory_record(tmp_path):
-    section = dns.CnameSection(
+    bound = dns.cname(
         records=[
             {"name": "vault.tellabs.dev", "target": "vault.app.tellabs.dev"},
             {"name": "wiki.tellabs.dev", "target": "wiki.app.tellabs.dev", "advisory": True},
         ]
     )
     fake = FakeDns(cnames={"vault.tellabs.dev": ["vault.app.tellabs.dev"]})
-    result = run(dns.cname, section, tmp_path, fake)
+    result = run(bound, tmp_path, fake)
     items = {i.key: i for i in result.items}
     assert items["vault.tellabs.dev"].status is Status.OK
     assert items["wiki.tellabs.dev"].advisory is True
@@ -101,39 +99,36 @@ def test_cname_with_an_advisory_record(tmp_path):
     assert result.status is Status.OK
 
 
-def test_delegation_texts_name_no_account_and_can_be_replaced(tmp_path):
+def test_delegation_texts_name_no_account(tmp_path):
     fake = FakeDns(
         referrals={
             "app.tellabs.dev": Referral("none", frozenset()),
             "old.tellabs.dev": Referral("referral", frozenset({"ns-1.example"})),
         }
     )
-    step = run(dns.delegated, delegation(), tmp_path, fake).items[0].next_step
+    step = run(delegation(), tmp_path, fake).items[0].next_step
     assert step.do == (
         "In the zone that holds tellabs.dev, set the NS record for app.tellabs.dev to exactly "
         "these servers, replacing any others:"
     )
-    assert step.generic is True
     assert step.paste == "app.tellabs.dev. NS ns-1.example.\napp.tellabs.dev. NS ns-2.example."
-    section = dns.UndelegatedSection(root="tellabs.dev", zones=["old"])
-    step = run(dns.undelegated, section, tmp_path, fake).items[0].next_step
+    bound = dns.undelegated(root="tellabs.dev", zones=["old"])
+    step = run(bound, tmp_path, fake).items[0].next_step
     assert step.do.startswith(
         "In the zone that holds tellabs.dev, remove the NS record for old.tellabs.dev;"
     )
-    assert step.generic is True
 
 
 @pytest.mark.parametrize(
     "build",
     [
-        lambda: dns.CaaSection(domain="tellabs.dev", issuers=[]),
-        lambda: dns.CaaSection(domain="tellabs.dev", issuers=['amazon.com"; x']),
-        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"": ["ns.example."]}),
-        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"app": ["ns 1 bad"]}),
-        lambda: dns.DelegationSection(root="a.dev", zones=[], name_servers={"app": [""]}),
-        lambda: dns.DelegationSection(root="a.dev", zones=["app", "app"], name_servers={}),
-        lambda: dns.UndelegatedSection(root="a.dev", zones=["old", "old"]),
-        lambda: dns.CnameSection(
+        lambda: dns.caa(domain="tellabs.dev", issuers=[]),
+        lambda: dns.caa(domain="tellabs.dev", issuers=['amazon.com"; x']),
+        lambda: dns.delegated(root="a.dev", name_servers={"": ["ns.example."]}),
+        lambda: dns.delegated(root="a.dev", name_servers={"app": ["ns 1 bad"]}),
+        lambda: dns.delegated(root="a.dev", name_servers={"app": [""]}),
+        lambda: dns.undelegated(root="a.dev", zones=["old", "old"]),
+        lambda: dns.cname(
             records=[
                 {"name": "Vault.tellabs.dev", "target": "a.tellabs.dev"},
                 {"name": "vault.tellabs.dev.", "target": "b.tellabs.dev"},
@@ -141,26 +136,26 @@ def test_delegation_texts_name_no_account_and_can_be_replaced(tmp_path):
         ),
     ],
 )
-def test_section_values_are_validated(build):
-    with pytest.raises(ValidationError):
+def test_arguments_are_validated(build):
+    with pytest.raises(CheckCallError):
         build()
 
 
 def test_duplicates_are_named():
-    with pytest.raises(ValidationError, match="duplicate entries: vault.tellabs.dev"):
-        dns.CnameSection(
+    with pytest.raises(CheckCallError, match="duplicate entries: vault.tellabs.dev"):
+        dns.cname(
             records=[
                 {"name": "Vault.tellabs.dev", "target": "a.tellabs.dev"},
                 {"name": "vault.tellabs.dev.", "target": "b.tellabs.dev"},
             ]
         )
-    with pytest.raises(ValidationError, match="duplicate entries: app"):
-        dns.UndelegatedSection(root="a.dev", zones=["app", "api", "app"])
+    with pytest.raises(CheckCallError, match="duplicate entries: app"):
+        dns.undelegated(root="a.dev", zones=["app", "api", "app"])
 
 
 def test_caa(tmp_path):
-    section = dns.CaaSection(domain="tellabs.dev", issuers=["amazon.com", "amazontrust.com"])
+    bound = dns.caa(domain="tellabs.dev", issuers=["amazon.com", "amazontrust.com"])
     fake = FakeDns(caa={"tellabs.dev": ['0 issue "amazon.com"', '0 iodef "mailto:x@y"']})
-    item = run(dns.caa, section, tmp_path, fake).items[0]
+    item = run(bound, tmp_path, fake).items[0]
     assert item.status is Status.FAIL
     assert item.next_step.paste == 'tellabs.dev. CAA 0 issue "amazontrust.com"'
