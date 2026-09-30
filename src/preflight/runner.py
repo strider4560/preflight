@@ -17,6 +17,10 @@ from preflight.identity import worker_environment
 from preflight.outcome import Outcome, ok, outcome
 from preflight.worker import Job, kill_all, launch
 
+NOT_OBSERVED = "not observed (--validate)"
+"""What every check observes under --validate: unknown, never present or absent. A `str`, so a
+check taking a `str` argument still validates when a provider passes it on."""
+
 
 class Executor(Protocol):
     def run(self, checks: Sequence[BoundCheck]) -> list[Outcome]: ...
@@ -66,7 +70,7 @@ class StandInExecutor:
     """For --validate: nothing is observed and no worker starts; every check stands in as ok."""
 
     def run(self, checks: Sequence[BoundCheck]) -> list[Outcome]:
-        return [outcome(ok(observed="not observed (--validate)")) for _ in checks]
+        return [outcome(ok(observed=NOT_OBSERVED)) for _ in checks]
 
 
 _CURRENT: ContextVar[Executor | None] = ContextVar("preflight_executor", default=None)

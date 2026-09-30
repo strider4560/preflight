@@ -8,7 +8,8 @@ from fakes import IDENTITY
 
 from preflight import runner
 from preflight.outcome import Status
-from preflight.runner import StandInExecutor, WorkerExecutor, probe_now, using
+from preflight.params import observed
+from preflight.runner import NOT_OBSERVED, StandInExecutor, WorkerExecutor, probe_now, using
 
 CHECKS = """
 import os
@@ -92,7 +93,13 @@ def test_stand_ins_observe_nothing(repo, checks, monkeypatch):
     monkeypatch.setattr(runner, "launch", no_launch)
     (result,) = StandInExecutor().run([checks.sample(name="x", mode="fail")])
     assert result.status is Status.OK
-    assert result.items[0].observed == "not observed (--validate)"
+    assert result.items[0].observed is NOT_OBSERVED
+
+
+def test_a_stand_in_observes_not_observed_for_any_key(repo, checks):
+    (result,) = StandInExecutor().run([checks.sample(name="x")])
+    assert observed(result) is NOT_OBSERVED
+    assert observed(result, key="anything") is NOT_OBSERVED
 
 
 def test_probe_now_runs_only_inside_a_run(repo, checks):
