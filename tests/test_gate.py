@@ -622,7 +622,9 @@ def test_verify_with_an_argument_the_gate_lacks_is_the_programs_failure(tmp_path
             run.verify(after)
     assert exc.value.code == 2
     assert log == ["enter", "exit"]
-    assert "the program raised GateDefinitionError" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "verify: argument extra is not an argument of the gate" in err
+    assert "raised" not in err
 
 
 def test_a_provider_that_raises_in_the_block_exits_2_with_its_type_only(tmp_path, capsys):

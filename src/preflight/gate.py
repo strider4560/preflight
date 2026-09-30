@@ -144,7 +144,7 @@ class Gate(Guards):
         except Exception as exc:
             kill_all()
             code = 2
-            print(f"{self._prog()}: the program raised {type(exc).__name__}", file=sys.stderr)
+            self._report_failure(exc)
         finally:
             session.close()
             for problem in session.resolver.cleanup_problems:
@@ -155,6 +155,14 @@ class Gate(Guards):
             raise SystemExit(code)
         if passing is not None:
             raise passing  # re-raised, not returned: contextlib would swallow a return
+
+    def _report_failure(self, exc: Exception) -> None:
+        """A definition error names arguments and guards, never values; anything else, its type."""
+        if isinstance(exc, GateDefinitionError):
+            for problem in exc.problems:
+                print(f"{self._prog()}: {problem}", file=sys.stderr)
+        else:
+            print(f"{self._prog()}: the program raised {type(exc).__name__}", file=sys.stderr)
 
     def execute(
         self,
