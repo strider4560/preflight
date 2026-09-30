@@ -31,7 +31,7 @@ if __name__ == "__main__":
 - Leaving the block, however it ends, runs the providers' cleanup in reverse order, as at the end of `run()`. A cleanup that raises is printed to stderr and turns a passing exit into 3.
   - A `SystemExit` from the block (a `verify` that stopped, or the program's own) propagates with its code.
   - Ctrl-C, SIGTERM or SIGHUP kill every live worker and exit 130.
-  - An `Unmet` raised in the block itself (an `observed` the program calls) prints its steps as a one-guard worklist, `needs the program`, and exits 1.
+  - An `Unmet` raised in the block itself (an `observed` the program calls) prints its steps as a one-guard worklist, `needs <provider>` (or `needs the program` when no provider raised it), and exits 1.
   - Any other exception from the block is the program's own failure: `<prog>: the program raised <Type>` on stderr, exit 2, the type only. A `GateDefinitionError` (such as `run.verify` given a guard whose argument the gate lacks) prints its problems instead, which name arguments and guards, never values.
 
 `run()` is unchanged in behavior and shares the same run loop, so a gate that is only a gate keeps working.
@@ -53,7 +53,7 @@ A helper, `preflight.observed(outcome, key=None)`, returns the observed value of
 
 - **Guards**, in order: `iac.ids_filled`; "this shell is the account's administrator" (`aws.assumed`, `aws.region`); "the checkout holds the latest main" (`git.up_to_date`); "the state is where the plan expects it" (one iac check that restates the observed plan as an `ok` item: bucket status, local state, state object).
 - **`state_plan`**, a provider, observes the bucket status, the local `terraform.tfstate` and the state object, and decides. The three refusals raise `Unmet` with the shell's messages: a forbidden bucket name ("set `state_bucket_suffix`"), a present bucket with local state and a state object ("refusing to overwrite; compare the two by hand"), a present bucket with no local state and no object ("import the existing resources by hand"). `first_run` is "the bucket is absent, or local state exists".
-- **The block** restores a leftover `backend.tf.off` first, then runs the shell's tofu steps one for one through `subprocess.run(..., check=True, cwd=STACK)` with inherited stdio, restoring `backend.tf` in a `finally` as the shell's `trap` did, and ends with `run.verify(iac.bootstrap_published)`.
+- **The block** restores a leftover `backend.tf.off` first, then runs the shell's tofu steps one for one through `subprocess.Popen` with inherited stdio (waiting for tofu through an interrupt, and sending it SIGINT after a grace period if the interrupt never reached it), restoring `backend.tf` in a `finally` as the shell's `trap` did, and ends with `run.verify(iac.bootstrap_published)`.
 - **`iac.bootstrap_published`** is a `Guards()` holding the milestone's "bootstrap published" guard; `preflight/bootstrap.py` includes it, so "is bootstrap applied?" and the program's verification are one definition. `preflight/bootstrap_entry.py` is retired.
 - `task preflight:validate` and CI validate `preflight/bootstrap.py` and `scripts/bootstrap.py` in both environments. README and AGENTS.md name `scripts/bootstrap.py`.
 
