@@ -78,7 +78,11 @@ def _clean_imports():
     before = list(sys.path)
     yield
     sys.path[:] = before
-    for name in [n for n in sys.modules if n == "workerchecks" or n.startswith("preflight_gate_")]:
+    for name in [
+        n
+        for n in sys.modules
+        if n in ("workerchecks", "elsewhere") or n.startswith("preflight_gate_")
+    ]:
         del sys.modules[name]
     reset_stop()
 
@@ -123,6 +127,21 @@ def test_a_check_in_a_gate_file_loads_without_running_the_gate(repo):
     result = launch(loaded, env=dict(os.environ), timeout=60)
     assert result.items[0].observed == str(repo)
     assert not (repo / "gate" / "ran-as-main").exists()
+
+
+def test_a_check_module_outside_the_gate_directory_imports_from_its_file(repo):
+    (repo / "gate").mkdir()
+    lib = write(repo, "lib/elsewhere.py", CHECKS)
+    elsewhere = Job(
+        label="elsewhere.sample",
+        module="elsewhere",
+        file=str(lib),
+        name="sample",
+        gate_dir=str(repo / "gate"),
+        root=str(repo),
+        arguments="{}",
+    )
+    assert launch(elsewhere, env=dict(os.environ), timeout=60).status is Status.OK
 
 
 def test_a_timeout_kills_the_whole_process_group(repo):

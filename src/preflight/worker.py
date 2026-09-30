@@ -47,10 +47,16 @@ class Job:
 def load_module(job: Job) -> ModuleType:
     """The check's module. A gate file loads by path under a name of its own, so its
     `if __name__ == "__main__": gate.run()` does not fire. The gate's directory is appended to
-    the path, after preflight's own imports, so a gate's modules cannot shadow them."""
+    the path, after preflight's own imports, so a gate's modules cannot shadow them. So is the
+    directory of the check's own file, for a module the gate imported from a directory it put
+    on its own path."""
     if job.gate_dir and job.gate_dir not in sys.path:
         sys.path.append(job.gate_dir)
     if job.module != "__main__":
+        if job.file:
+            home = str(Path(job.file).parent)
+            if home not in sys.path:
+                sys.path.append(home)
         return importlib.import_module(job.module)
     if not job.file:
         raise ImportError("the gate file is unknown")

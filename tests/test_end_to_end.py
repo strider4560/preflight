@@ -271,3 +271,35 @@ def test_a_program_never_acts_when_a_guard_stops(repo):
     assert result.returncode == 1
     assert not (repo / "MARKER").exists()
     assert "Create README.md." in result.stdout
+
+
+LIBRARY_GATE = """
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+from preflight import Gate
+
+import helpers2
+
+gate = Gate("library")
+
+
+@gate.guard("marker present")
+def marker():
+    return [helpers2.marker(name="MARKER")]
+
+
+if __name__ == "__main__":
+    gate.run()
+"""
+
+
+def test_a_check_module_imported_from_a_directory_the_gate_added_runs(repo):
+    write(repo, "lib/helpers2.py", HELPERS)
+    write(repo, "MARKER", "x\n")
+    gate = write(repo, "gate/library.py", LIBRARY_GATE)
+    result = run(gate, cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
