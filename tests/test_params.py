@@ -63,8 +63,15 @@ def test_the_same_argument_with_another_type_is_a_gate_error():
 def test_validate_is_reserved():
     def v(validate: Annotated[bool, Arg()] = False): ...
 
-    with pytest.raises(GateDefinitionError, match="reserved"):
+    with pytest.raises(GateDefinitionError, match="argument validate is reserved for --validate"):
         collect_args([v], {})
+
+
+def test_help_is_reserved():
+    def h(help: Annotated[str, Arg()] = ""): ...
+
+    with pytest.raises(GateDefinitionError, match="argument help is reserved for --help"):
+        collect_args([h], {})
 
 
 def test_a_provider_cycle_is_a_gate_error():

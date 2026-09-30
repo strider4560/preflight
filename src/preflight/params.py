@@ -151,8 +151,11 @@ def collect_args(
 
     for root in roots:
         visit(root, ())
-    if "validate" in specs:
-        problems.append("argument validate is reserved for --validate")
+    problems.extend(
+        f"argument {name} is reserved for --{name}"
+        for name in ("validate", "help")
+        if name in specs
+    )
     if problems:
         raise GateDefinitionError(problems)
     return list(specs.values())
