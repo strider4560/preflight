@@ -132,6 +132,8 @@ Checks shell out to these tools, each needed only by the checks that use it: the
 | 3 | Preflight itself failed |
 | 130 | Interrupted |
 
+`--help` exits 2, so a wrapper that stops on a nonzero exit never proceeds on it.
+
 `--validate` runs the gate without credentials and observes nothing: it parses the arguments,
 resolves the gate's providers (so its own file reading runs) and validates every check's
 arguments. Add it to CI.

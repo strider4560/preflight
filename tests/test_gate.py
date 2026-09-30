@@ -161,6 +161,14 @@ def test_a_bad_command_line_exits_2_without_running(tmp_path, capsys):
     assert "invalid choice: 'qa'" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_exits_2_so_a_wrapper_never_proceeds(tmp_path, capsys, flag):
+    executor = Scripted()
+    result = run(three_guards(), argv=(flag,), executor=executor, tmp=tmp_path)
+    assert (result.exit_code, executor.ran) == (2, [])
+    assert "usage:" in capsys.readouterr().out
+
+
 def test_provider_and_guard_exceptions_report_only_their_type(tmp_path):
     def admin(env: Env) -> str:
         raise KeyError("account_id=123456789012")

@@ -118,8 +118,8 @@ class Gate(Guards):
             return _finish(replace(base, problems=tuple(exc.problems)))
         try:
             values, validate = parse_args(self._prog(), specs, base.arguments)
-        except SystemExit as exc:  # argparse printed usage (or help)
-            return replace(base, exit_code=exc.code if isinstance(exc.code, int) else 2)
+        except SystemExit:  # argparse printed usage or help; neither is a pass
+            return replace(base, exit_code=2)
         try:
             root = root or self._root()
         except GateDefinitionError as exc:
