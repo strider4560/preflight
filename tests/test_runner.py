@@ -30,6 +30,11 @@ def sample(probe, name: str, mode: str = "ok"):
 def environment(probe, identity: Identity):
     keys = ("AWS_PROFILE", "AWS_REGION", "AWS_ACCESS_KEY_ID")
     return outcome(ok(observed={k: os.environ.get(k) for k in keys}))
+
+
+@check(ambient=True)
+def ambient_environment(probe, identity: Identity):
+    return outcome(ok(observed=os.environ.get("AWS_PROFILE")))
 """
 
 
@@ -69,6 +74,15 @@ def test_an_identity_argument_sets_the_workers_profile_and_region(repo, checks, 
         "AWS_REGION": "us-east-1",
         "AWS_ACCESS_KEY_ID": None,
     }
+
+
+def test_an_ambient_check_keeps_the_callers_profile(repo, checks, monkeypatch):
+    monkeypatch.setenv("AWS_PROFILE", "elsewhere")
+    ambient, cleaned = executor(repo).run(
+        [checks.ambient_environment(identity=IDENTITY), checks.environment(identity=IDENTITY)]
+    )
+    assert ambient.items[0].observed == "elsewhere"
+    assert cleaned.items[0].observed["AWS_PROFILE"] == "sandbox"
 
 
 def test_stand_ins_observe_nothing(repo, checks, monkeypatch):
