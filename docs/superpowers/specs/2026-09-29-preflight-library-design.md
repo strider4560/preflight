@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-09-29 (revised the same day after four adversarial reviews) |
-| Status | Draft, awaiting operator review |
+| Status | Superseded by `2026-09-29-preflight-gate-programs-design.md` (gates as programs; no contracts, no CLI) |
 | Design driver | `tellabsadmin/iac` (`~/Develop/tellabs/iac`), its account bootstrap |
 | Replaces | This repo's vendored drop-in scaffold (`gate/`, `checks/`, `contracts/`, `run.py`) |
 
