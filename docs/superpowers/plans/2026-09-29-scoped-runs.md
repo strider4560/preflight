@@ -1003,7 +1003,20 @@ def state(plan: Plan):
 
 
 def tofu(*args: str, run=subprocess.run) -> None:
-    run(["tofu", *args], cwd=STACK, check=True)
+    """Runs tofu with inherited stdio. On Ctrl-C the terminal has already sent tofu SIGINT, so
+    keep waiting for it to finish its own shutdown instead of letting subprocess.run SIGKILL it
+    a quarter second later (which would leave a stale state lock behind)."""
+    if run is not subprocess.run:
+        run(["tofu", *args], cwd=STACK, check=True)
+        return
+    process = subprocess.Popen(["tofu", *args], cwd=STACK)
+    try:
+        code = process.wait()
+    except KeyboardInterrupt:
+        code = process.wait()
+        raise
+    if code != 0:
+        raise subprocess.CalledProcessError(code, ["tofu", *args])
 
 
 def var_files(env: str) -> list[str]:
