@@ -105,6 +105,10 @@ class Check:
                 self.id,
                 [f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()],
             ) from None
+        try:  # the worker receives the arguments as JSON; refuse now what it could not read
+            self.arguments.model_validate_json(arguments.model_dump_json())
+        except Exception:
+            raise CheckCallError(self.id, ["arguments must be JSON-serializable"]) from None
         if timeout is not None and not timeout > 0:
             raise CheckCallError(self.id, ["timeout: must be greater than 0"])
         return BoundCheck(self, arguments, float(timeout) if timeout else self.timeout)

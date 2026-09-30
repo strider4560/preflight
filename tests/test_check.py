@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 from fakes import IDENTITY
 
@@ -14,6 +16,11 @@ def sample(probe: Probe, name: str, count: int = 1, tags: tuple[str, ...] = ()) 
 
 @check(ambient=True, timeout=5)
 def with_identity(probe: Probe, identity: Identity) -> Outcome:
+    return outcome(ok())
+
+
+@check
+def anything(probe: Probe, value: Any) -> Outcome:
     return outcome(ok())
 
 
@@ -35,6 +42,12 @@ def test_ids_come_from_the_module_and_function():
 def test_wrong_types_raise_a_check_call_error_naming_the_field():
     with pytest.raises(CheckCallError, match=r"^test_check\.sample: count: Input should be"):
         sample("a", count="many")
+
+
+def test_arguments_a_worker_could_not_read_are_refused_at_the_call():
+    assert anything(value={"a": [1, 2]}).values == {"value": {"a": [1, 2]}}
+    with pytest.raises(CheckCallError, match="arguments must be JSON-serializable"):
+        anything(value=object())
 
 
 def test_missing_and_unknown_arguments_are_refused():
