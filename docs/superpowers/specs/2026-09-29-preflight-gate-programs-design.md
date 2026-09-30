@@ -262,7 +262,7 @@ assert result.exit_code == 1
 assert result.stopped_at == "bootstrap published"
 ```
 
-`GateClient` runs the gate in process, replacing each named check's result by function; a check without a stand-in is an error in the test, so no worker starts and nothing is observed. `dependency_overrides` replaces providers as in FastAPI.
+`GateClient` runs the gate in process, replacing each named check's result by function, for the guards' checks and for `probe_now` calls from providers alike (`aws.session` behind `aws.signed_in`, unless that provider is overridden). A check without a stand-in is an error in the test, so no worker starts and nothing is observed. `dependency_overrides` replaces providers as in FastAPI.
 
 The library's own tests stay offline:
 
