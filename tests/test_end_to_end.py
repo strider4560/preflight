@@ -1,8 +1,11 @@
 """A gate script run as a program against a scratch repository: real workers, real testinfra,
 no network."""
 
+import os
+import signal
 import subprocess
 import sys
+import time
 
 from conftest import write
 
@@ -58,6 +61,44 @@ gate.include(shared)
 @gate.guard("environment ready")
 def environment(env: Env, seen: Logged):
     return [env_file(env=env), helpers.marker(name="MARKER")]
+
+
+if __name__ == "__main__":
+    gate.run()
+"""
+
+
+SLOW = """
+import os
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Annotated
+
+from preflight import Depends, Gate, Outcome, Probe, check, ok, outcome
+
+LOG = Path(__file__).resolve().parent.parent / "cleanup.log"
+
+
+@check
+def sleeps(probe: Probe) -> Outcome:
+    (probe.root / "worker.pid.tmp").write_text(str(os.getpid()))
+    (probe.root / "worker.pid.tmp").rename(probe.root / "worker.pid")
+    time.sleep(20)
+    return outcome(ok())
+
+
+def logged() -> Iterator[str]:
+    yield "held"
+    LOG.write_text("cleaned")
+
+
+gate = Gate("slow")
+
+
+@gate.guard("waits")
+def waits(held: Annotated[str, Depends(logged)]):
+    return [sleeps()]
 
 
 if __name__ == "__main__":
@@ -128,3 +169,42 @@ def test_no_bytecode_is_left_in_the_repository(repo):
     gate = setup(repo)
     run(gate, "dev", cwd=repo)
     assert list(repo.rglob("__pycache__")) == []
+
+
+def _wait_for(condition, seconds):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_sigterm_kills_workers_cleans_up_and_exits_130(repo):
+    gate = write(repo, "gate/slow.py", SLOW)
+    process = subprocess.Popen(
+        [sys.executable, str(gate)],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stderr.readline() == "… waits\n"
+        pid_file = repo / "worker.pid"
+        _wait_for(pid_file.exists, 5)
+        worker = int(pid_file.read_text())
+        process.send_signal(signal.SIGTERM)
+        stdout, _ = process.communicate(timeout=5)
+    finally:
+        process.kill()
+    assert process.returncode == 130
+    assert "interrupted during guard 'waits'" in stdout
+    assert (repo / "cleanup.log").read_text() == "cleaned"
+    _wait_for(lambda: _gone(worker), 3)

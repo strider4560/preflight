@@ -5,10 +5,12 @@ guard that does not pass."""
 from __future__ import annotations
 
 import contextlib
+import signal
 import subprocess
 import sys
+import threading
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar
@@ -80,7 +82,8 @@ class Gate(Guards):
             print(f"… {name}", file=sys.stderr, flush=True)
 
         try:
-            result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
+            with _terminate_as_interrupt():
+                result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
         except KeyboardInterrupt:
             raise SystemExit(130) from None
         sys.stdout.write(result.output)
@@ -240,6 +243,27 @@ class Gate(Guards):
         if done.returncode != 0:
             raise GateDefinitionError([f"{self.file.name} is not inside a git work tree"])
         return Path(done.stdout.strip()).resolve()
+
+
+@contextlib.contextmanager
+def _terminate_as_interrupt() -> Iterator[None]:
+    """SIGTERM and SIGHUP (a cancelled CI job, a closed terminal) interrupt the run as Ctrl-C
+    does, so workers are killed and providers clean up; the previous handlers are restored."""
+
+    def interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    previous: dict[int, Any] = {}
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for name in ("SIGTERM", "SIGHUP"):
+                number = getattr(signal, name, None)
+                if number is not None:
+                    previous[number] = signal.signal(number, interrupt)
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, signal.SIG_DFL if handler is None else handler)
 
 
 def _labels(checks: Sequence[BoundCheck]) -> list[str]:

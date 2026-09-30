@@ -130,7 +130,7 @@ Checks shell out to these tools, each needed only by the checks that use it: the
 | 1 | A guard stopped the run |
 | 2 | The gate is wrong (bad arguments, a check called with the wrong types, a guard returning something other than checks, an exception in the gate's own code); nothing more was observed |
 | 3 | Preflight itself failed |
-| 130 | Interrupted |
+| 130 | Interrupted (Ctrl-C, SIGTERM or SIGHUP); workers are killed and providers clean up |
 
 `--help` exits 2, so a wrapper that stops on a nonzero exit never proceeds on it.
 
