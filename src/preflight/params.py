@@ -137,6 +137,10 @@ def collect_args(
             spec = ArgSpec(
                 parameter.name, parameter.annotation, parameter.default, parameter.marker.help
             )
+            if get_origin(spec.annotation) is Literal and not all(
+                isinstance(c, str) for c in get_args(spec.annotation)
+            ):
+                problems.append(f"argument {spec.name}: Literal choices must be strings")
             existing = specs.get(spec.name)
             if existing is None:
                 specs[spec.name] = spec
@@ -159,7 +163,7 @@ def parse_args(
 ) -> tuple[dict[str, Any], bool]:
     """The arguments' values and whether --validate was given; a bad command line prints usage
     and raises SystemExit(2), as argparse does."""
-    parser = argparse.ArgumentParser(prog=prog)
+    parser = argparse.ArgumentParser(prog=prog, allow_abbrev=False)
     for spec in specs:
         choices = (
             [str(c) for c in get_args(spec.annotation)]
@@ -168,6 +172,14 @@ def parse_args(
         )
         if spec.default is EMPTY:
             parser.add_argument(spec.name, help=spec.help, choices=choices)
+        elif spec.annotation is bool:
+            parser.add_argument(
+                f"--{spec.name.replace('_', '-')}",
+                dest=spec.name,
+                default=spec.default,
+                help=spec.help,
+                action=argparse.BooleanOptionalAction,
+            )
         else:
             parser.add_argument(
                 f"--{spec.name.replace('_', '-')}",

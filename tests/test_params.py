@@ -205,3 +205,28 @@ def test_propagate_passes_through_providers_unwrapped():
     r, _ = resolver()
     with pytest.raises(Stop):
         r.arguments(guard)
+
+
+def test_literal_choices_must_be_strings():
+    def n(level: Annotated[Literal[1, 2], Arg()]): ...
+
+    with pytest.raises(
+        GateDefinitionError, match="argument level: Literal choices must be strings"
+    ):
+        collect_args([n], {})
+
+
+def test_bool_options_are_switches():
+    specs = [SPECS[0], ArgSpec("dry_run", bool, False, None)]
+    assert parse_args("gate.py", specs, ["dev", "--dry-run"]) == (
+        {"env": "dev", "dry_run": True},
+        False,
+    )
+    assert parse_args("gate.py", specs, ["dev"])[0]["dry_run"] is False
+    assert parse_args("gate.py", specs, ["dev", "--no-dry-run"])[0]["dry_run"] is False
+
+
+def test_option_abbreviations_are_refused():
+    with pytest.raises(SystemExit) as exc:
+        parse_args("gate.py", SPECS, ["dev", "--val"])
+    assert exc.value.code == 2
