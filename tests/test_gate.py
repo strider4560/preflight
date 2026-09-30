@@ -9,8 +9,9 @@ from preflight import gate as gate_module
 from preflight.check import check
 from preflight.gate import Gate, Guards
 from preflight.outcome import Outcome, fail, ok, outcome
-from preflight.params import Arg, Depends, Unmet
+from preflight.params import Arg, Depends, Unmet, observed
 from preflight.probe import Probe
+from preflight.runner import probe_now
 
 Env = Annotated[Literal["dev", "prod"], Arg()]
 
@@ -341,3 +342,269 @@ def test_run_exits_130_when_interrupted_outside_the_guard_loop(capsys, monkeypat
         gate.run(["dev"])
     assert exc.value.code == 130
     assert capsys.readouterr().out == ""
+
+
+def checked_gate(log):
+    def session() -> Iterator[str]:
+        log.append("enter")
+        yield "s"
+        log.append("exit")
+
+    def lazy() -> str:
+        log.append("lazy")
+        return "L"
+
+    gate = Gate("program")
+
+    @gate.guard("ready")
+    def ready(env: Env, s: Annotated[str, Depends(session)]):
+        return [thing(name=env)]
+
+    return gate, session, lazy
+
+
+def test_checked_enters_the_block_with_arguments_and_providers(tmp_path, capsys):
+    log = []
+    gate, session, lazy = checked_gate(log)
+    with gate.checked(["dev"], executor=Scripted(), root=tmp_path) as run:
+        assert run.args["env"] == "dev"
+        assert run[session] == "s"
+        assert log == ["enter"]
+        assert run[lazy] == "L" and run[lazy] == "L"
+        assert log == ["enter", "lazy"]
+        log.append("block")
+    assert log == ["enter", "lazy", "block", "exit"]
+    assert "  ✓ ready\n" in capsys.readouterr().out
+
+
+def test_checked_exits_1_before_the_block_when_a_guard_stops(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    stop = Scripted({"test_gate.thing(dev)": outcome(fail(do="Not yet."))})
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=stop, root=tmp_path):
+            log.append("block")
+    assert exc.value.code == 1
+    assert log == ["enter", "exit"]
+    assert "Not yet." in capsys.readouterr().out
+
+
+def test_checked_under_validate_exits_0_without_the_block(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev", "--validate"], executor=Scripted(), root=tmp_path):
+            log.append("block")
+    assert exc.value.code == 0
+    assert "block" not in log
+    assert "Validated every guard" in capsys.readouterr().out
+
+
+def test_verify_runs_more_guards_in_the_same_scope(tmp_path, capsys):
+    log = []
+    gate, session, _ = checked_gate(log)
+    after = Guards()
+
+    @after.guard("published")
+    def published(s: Annotated[str, Depends(session)]):
+        return [thing(name=f"after-{s}")]
+
+    executor = Scripted()
+    with gate.checked(["dev"], executor=executor, root=tmp_path) as run:
+        run.verify(after)
+    assert executor.ran == ["test_gate.thing(dev)", "test_gate.thing(after-s)"]
+    assert log == ["enter", "exit"]
+    assert capsys.readouterr().out.count("Every guard passed.") == 2
+
+
+def test_verify_that_stops_exits_1_and_still_cleans_up(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    after = Guards()
+    after.guard("published")(lambda: [thing(name="x")])
+    stop = Scripted({"test_gate.thing(x)": outcome(fail(do="Publish it."))})
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=stop, root=tmp_path) as run:
+            run.verify(after)
+            log.append("unreachable")
+    assert exc.value.code == 1
+    assert log == ["enter", "exit"]
+    assert "Publish it." in capsys.readouterr().out
+
+
+def test_an_exception_in_the_block_is_the_programs_failure(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            raise KeyError("account_id=123456789012")
+    assert exc.value.code == 2
+    assert log == ["enter", "exit"]
+    err = capsys.readouterr().err
+    assert "the program raised KeyError" in err and "123456789012" not in err
+
+
+def test_an_interrupt_in_the_block_cleans_up_and_exits_130(tmp_path, monkeypatch):
+    killed = []
+    monkeypatch.setattr(gate_module, "kill_all", lambda: killed.append(True))
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            raise KeyboardInterrupt
+    assert exc.value.code == 130
+    assert killed == [True] and log == ["enter", "exit"]
+
+
+def test_run_resolves_providers_on_demand_and_reports_unmet(tmp_path, capsys):
+    def signed() -> str:
+        raise Unmet(fail(do="Sign in to profile sandbox.", paste="aws sso login"))
+
+    gate = Gate("program")
+    gate.guard("ready")(lambda: [thing(name="r")])
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked([], executor=Scripted(), root=tmp_path) as run:
+            run[signed]
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "needs signed" in out and "aws sso login" in out
+
+
+def test_an_unmet_raised_in_the_block_is_a_worklist_and_exits_1(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    looks = Scripted({"test_gate.thing(x)": outcome(fail(do="Could not look."))})
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=looks, root=tmp_path):
+            observed(probe_now(thing(name="x")))
+            log.append("unreachable")
+    assert exc.value.code == 1
+    assert log == ["enter", "exit"]
+    captured = capsys.readouterr()
+    assert "needs the program" in captured.out and "Could not look." in captured.out
+    assert "raised" not in captured.err
+
+
+def test_probe_now_works_inside_the_block(tmp_path):
+    answer = outcome(ok(observed="present"))
+    executor = Scripted({"test_gate.thing(x)": answer})
+    gate = Gate("program")
+    gate.guard("ready")(lambda: [thing(name="r")])
+    with gate.checked([], executor=executor, root=tmp_path):
+        assert probe_now(thing(name="x")) is answer
+    assert executor.ran == ["test_gate.thing(r)", "test_gate.thing(x)"]
+
+
+def test_a_cleanup_failure_after_a_passing_block_exits_3(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        with cleaned_gate([], cleanup_raises=True).checked([], executor=Scripted(), root=tmp_path):
+            pass
+    assert exc.value.code == 3
+    assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
+
+
+def test_checked_that_fails_before_the_guards_exits_3_without_the_message(
+    tmp_path, monkeypatch, capsys
+):
+    def broken(**kwargs):
+        raise RuntimeError("account_id=123456789012")
+
+    monkeypatch.setattr(gate_module, "WorkerExecutor", broken)
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], root=tmp_path):
+            log.append("block")
+    assert exc.value.code == 3
+    assert log == []
+    out = capsys.readouterr().out
+    assert "preflight failed (RuntimeError)" in out and "123456789012" not in out
+
+
+def test_an_interrupt_during_cleanup_exits_130(tmp_path):
+    def session() -> Iterator[str]:
+        yield "s"
+        raise KeyboardInterrupt
+
+    gate = Gate("program")
+
+    @gate.guard("ready")
+    def ready(s: Annotated[str, Depends(session)]):
+        return [thing(name=s)]
+
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked([], executor=Scripted(), root=tmp_path):
+            pass
+    assert exc.value.code == 130
+
+
+def test_a_passing_exit_from_the_block_still_exits_3_when_cleanup_fails(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        with cleaned_gate([], cleanup_raises=True).checked([], executor=Scripted(), root=tmp_path):
+            sys.exit(0)
+    assert exc.value.code == 3
+    assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
+
+
+def test_validate_still_exits_3_when_cleanup_fails(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        with cleaned_gate([], cleanup_raises=True).checked(
+            ["--validate"], executor=Scripted(), root=tmp_path
+        ):
+            pytest.fail("the block ran under --validate")
+    assert exc.value.code == 3
+    assert "provider session cleanup raised RuntimeError" in capsys.readouterr().err
+
+
+def test_a_passing_exit_from_the_block_with_clean_cleanup_exits_0(tmp_path):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            sys.exit(0)
+    assert exc.value.code == 0
+    assert log == ["enter", "exit"]
+
+
+def test_a_nonzero_system_exit_from_the_block_keeps_its_code_and_cleans_up(tmp_path):
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path):
+            raise SystemExit(4)
+    assert exc.value.code == 4
+    assert log == ["enter", "exit"]
+
+
+def test_verify_with_an_argument_the_gate_lacks_is_the_programs_failure(tmp_path, capsys):
+    log = []
+    gate, _, _ = checked_gate(log)
+    after = Guards()
+
+    @after.guard("extra")
+    def extra(extra: Annotated[str, Arg()]):
+        return [thing(name=extra)]
+
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path) as run:
+            run.verify(after)
+    assert exc.value.code == 2
+    assert log == ["enter", "exit"]
+    err = capsys.readouterr().err
+    assert "verify: argument extra is not an argument of the gate" in err
+    assert "raised" not in err
+
+
+def test_a_provider_that_raises_in_the_block_exits_2_with_its_type_only(tmp_path, capsys):
+    def broken() -> str:
+        raise KeyError("secret")
+
+    log = []
+    gate, _, _ = checked_gate(log)
+    with pytest.raises(SystemExit) as exc:
+        with gate.checked(["dev"], executor=Scripted(), root=tmp_path) as run:
+            run[broken]
+    assert exc.value.code == 2
+    assert log == ["enter", "exit"]
+    err = capsys.readouterr().err
+    assert "provider broken raised KeyError" in err and "secret" not in err

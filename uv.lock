@@ -333,7 +333,7 @@ wheels = [
 
 [[package]]
 name = "preflight"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "ansible" },
@@ -352,7 +352,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ansible", specifier = ">=11" },
+    { name = "ansible", specifier = ">=12" },
     { name = "boto3", specifier = ">=1.40,<2" },
     { name = "dnspython", specifier = ">=2.7,<3" },
     { name = "pydantic", specifier = ">=2.11,<3" },

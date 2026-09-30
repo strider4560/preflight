@@ -80,6 +80,41 @@ if __name__ == "__main__":
   `Path(__file__)` (for example `ROOT = Path(__file__).resolve().parent.parent`), not from the
   working directory.
 
+## A program that acts after its guards
+
+A gate that is also the action, such as an account bootstrap, uses a scoped run:
+
+```python
+if __name__ == "__main__":
+    with gate.checked(sys.argv[1:]) as run:
+        env, plan = run.args["env"], run[state_plan]
+        apply(env, plan)                  # the program's own work; preflight never runs it
+        run.verify(published)             # post-condition guards
+```
+
+`checked` runs the guards and enters the block only when every one passed (otherwise it prints
+the worklist and exits as `run()` would; under `--validate` it exits 0 without entering).
+Inside, the providers are still alive: `run.args` holds the parsed arguments, `run[provider]`
+a provider's value (a provider that raises `Unmet` prints its steps and exits 1), and
+`run.verify(guards)` runs more guards, exiting 1 if one stops. Leaving the block runs the
+providers' cleanup however it ends: a `SystemExit` keeps its code, an `Unmet` the block raises
+itself prints its steps and exits 1, Ctrl-C or SIGTERM exits 130, and any other exception is
+the program's own failure, exit 2 with the type (a definition error, such as `run.verify`
+given a guard whose argument the gate lacks, names its problem instead).
+
+A provider that decides on a fact reads it from a check: `observed(probe_now(s3.bucket_status(
+name, identity=identity)))` returns the item's observed value, or raises `Unmet` when the check
+could not observe it. Under `--validate` every fact a provider observes is
+`preflight.NOT_OBSERVED`, which a provider treats as unknown (never as present or absent) and
+never refuses on.
+
+Interrupts (Ctrl-C, SIGTERM, SIGHUP) arrive in the block as `KeyboardInterrupt`. A child the
+program runs with `subprocess.run` is SIGKILLed 0.25 s after it, so a child that needs a clean
+shutdown (tofu holding a state lock) runs under `subprocess.Popen`: on `KeyboardInterrupt`,
+keep waiting for the child (Ctrl-C at a terminal already sent it SIGINT), then re-raise. A
+SIGTERM or SIGHUP sent to the program alone never reaches the child, so wait a grace period
+and, if the child is still running, send it SIGINT yourself before waiting again.
+
 ## Your own checks
 
 ```python
@@ -112,6 +147,8 @@ value in an item. Define checks at module level, in the gate file or a module be
 | `aws.region` | `identity` | The profile's configured region |
 | `aws.session` | `identity` | Preflight can observe as the identity (used by `aws.signed_in`) |
 | `ssm.parameters_exist` | `names`, `identity` | Each parameter exists and is non-empty (read without decryption) |
+| `s3.bucket_status` | `bucket`, `identity` | Observes `present`, `absent` or `forbidden` (another account owns the name) |
+| `s3.object_exists` | `bucket`, `key`, `identity` | Observes whether the object exists |
 | `acm.issued` | `arn`, `identity` | Issued; or the exact validation CNAME to add; or waiting |
 | `tofu.plan_clean` | `dir`, `var_files`, `identity` | `tofu plan -detailed-exitcode` is 0 (no lock, read-only) |
 | `dns.delegated` | `root`, `name_servers` | The parent zone's own servers delegate exactly those servers |
@@ -123,8 +160,9 @@ value in an item. Define checks at module level, in the gate file or a module be
 | `sops.rule` | `paths`, `min_recipients`, `config` | A creation rule with enough age recipients covers each file |
 
 Checks shell out to these tools, each needed only by the checks that use it: the `aws` CLI
-(`aws.region`), `tofu` (`tofu.plan_clean`), `gh` 2.48 or newer (`github.*`), and `git`
-(`git.*`, `files.git_ignored`, `files.committed`; a gate must live in a git work tree).
+(`aws.region`, `s3.bucket_status`), `tofu` (`tofu.plan_clean`), `gh` 2.48 or newer
+(`github.*`), and `git` (`git.*`, `files.git_ignored`, `files.committed`; a gate must live in a
+git work tree).
 
 ## Running a gate
 
@@ -132,7 +170,7 @@ Checks shell out to these tools, each needed only by the checks that use it: the
 |---|---|
 | 0 | Every guard passed |
 | 1 | A guard stopped the run |
-| 2 | The gate is wrong (bad arguments, a check called with the wrong types, a guard returning something other than checks, an exception in the gate's own code); nothing more was observed |
+| 2 | The gate is wrong (bad arguments, a check called with the wrong types, a guard returning something other than checks, an exception in the gate's own code; in a block, the program raised an exception); nothing more was observed |
 | 3 | Preflight itself failed |
 | 130 | Interrupted (Ctrl-C, SIGTERM or SIGHUP); workers are killed and providers clean up |
 

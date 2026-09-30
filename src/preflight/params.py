@@ -12,7 +12,8 @@ from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
 
 from pydantic import TypeAdapter, ValidationError
 
-from preflight.outcome import Item, Outcome
+from preflight.outcome import Item, Outcome, Status
+from preflight.runner import NOT_OBSERVED
 
 EMPTY = inspect.Parameter.empty
 
@@ -268,3 +269,17 @@ class Resolver:
 
         self.stack.push(leave)
         return value
+
+
+def observed(outcome: Outcome, key: str | None = None) -> Any:
+    """The observed value of the ok item with `key`, for a provider deciding on a fact; an item
+    that is not ok raises Unmet carrying the whole outcome, so the guard shows its next step.
+    Under --validate it is NOT_OBSERVED, whatever the key."""
+    if len(outcome.items) == 1 and outcome.items[0].observed is NOT_OBSERVED:
+        return NOT_OBSERVED
+    for item in outcome.items:
+        if item.key == key:
+            if item.status is not Status.OK:
+                raise Unmet(outcome)
+            return item.observed
+    raise KeyError(key)

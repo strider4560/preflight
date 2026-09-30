@@ -10,9 +10,10 @@ import subprocess
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NoReturn, TypeVar
 
 from preflight.check import BoundCheck, CheckCallError
@@ -78,17 +79,90 @@ class Gate(Guards):
         self.file: Path | None = Path(caller).resolve() if caller else None
 
     def run(self, argv: Sequence[str] | None = None) -> NoReturn:
-        def progress(name: str) -> None:
-            print(f"… {name}", file=sys.stderr, flush=True)
-
         try:
             with _terminate_as_interrupt():
-                result = self.execute(sys.argv[1:] if argv is None else argv, progress=progress)
+                result = self.execute(sys.argv[1:] if argv is None else argv, progress=_progress)
         except KeyboardInterrupt:
             raise SystemExit(130) from None
-        sys.stdout.write(result.output)
-        sys.stdout.flush()
+        _emit(result)
         raise SystemExit(result.exit_code)
+
+    @contextlib.contextmanager
+    def checked(
+        self,
+        argv: Sequence[str] | None = None,
+        *,
+        executor: Executor | None = None,
+        root: Path | None = None,
+    ) -> Iterator[Run]:
+        """Runs the guards and enters the block only when every one passed, with the providers
+        still alive; otherwise prints the worklist and exits as run() would. Leaving the block
+        runs the providers' cleanup, however the block ends."""
+        arguments = tuple(sys.argv[1:] if argv is None else argv)
+        base = RunResult(self.name, arguments, exit_code=2)
+        try:
+            with _terminate_as_interrupt():
+                yield from self._checked(base, executor, root)
+        except KeyboardInterrupt:  # before the guards, or during the providers' cleanup
+            raise SystemExit(130) from None
+
+    def _checked(
+        self, base: RunResult, executor: Executor | None, root: Path | None
+    ) -> Iterator[Run]:
+        try:
+            prepared = self._prepare(base, executor, root)
+        except Propagate:
+            raise
+        except Exception as exc:
+            problem = f"preflight failed ({type(exc).__name__})"
+            prepared = _finish(replace(base, exit_code=3, problems=(problem,)))
+        if isinstance(prepared, RunResult):
+            _emit(prepared)
+            raise SystemExit(prepared.exit_code)
+        session = _Session(self, prepared.values, prepared.executor)
+        session.open()
+        code = 0
+        passing: SystemExit | None = None  # held until cleanup, which may turn it into 3
+        try:
+            result = _finish(session.run_guards(prepared.base, prepared.guards, _progress))
+            _emit(result)
+            if result.exit_code != 0 or result.validated:
+                raise SystemExit(result.exit_code)
+            yield Run(self, session, prepared)
+        except KeyboardInterrupt:
+            kill_all()
+            code = 130
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                raise
+            passing = exc
+        except Propagate:
+            raise
+        except Unmet as exc:  # the block's own observed(), as run[provider] reports one
+            _emit(_unmet(prepared.base, exc, exc.provider or "the program"))
+            code = 1
+        except Exception as exc:
+            kill_all()
+            code = 2
+            self._report_failure(exc)
+        finally:
+            session.close()
+            for problem in session.resolver.cleanup_problems:
+                print(f"{self._prog()}: {problem}", file=sys.stderr)
+        if session.resolver.cleanup_problems and code == 0:
+            code = 3
+        if code:
+            raise SystemExit(code)
+        if passing is not None:
+            raise passing  # re-raised, not returned: contextlib would swallow a return
+
+    def _report_failure(self, exc: Exception) -> None:
+        """A definition error names arguments and guards, never values; anything else, its type."""
+        if isinstance(exc, GateDefinitionError):
+            for problem in exc.problems:
+                print(f"{self._prog()}: {problem}", file=sys.stderr)
+        else:
+            print(f"{self._prog()}: the program raised {type(exc).__name__}", file=sys.stderr)
 
     def execute(
         self,
@@ -114,6 +188,23 @@ class Gate(Guards):
         root: Path | None,
         progress: Callable[[str], None] | None,
     ) -> RunResult:
+        prepared = self._prepare(base, executor, root)
+        if isinstance(prepared, RunResult):
+            return prepared
+        session = _Session(self, prepared.values, prepared.executor)
+        session.open()
+        try:
+            result = session.run_guards(prepared.base, prepared.guards, progress)
+        finally:
+            session.close()
+        problems = tuple(session.resolver.cleanup_problems)
+        exit_code = 3 if problems and result.exit_code == 0 else result.exit_code
+        return _finish(replace(result, exit_code=exit_code, problems=result.problems + problems))
+
+    def _prepare(
+        self, base: RunResult, executor: Executor | None, root: Path | None
+    ) -> _Prepared | RunResult:
+        """Everything before a guard runs; a RunResult is a finished failure (exit 2)."""
         try:
             guards = self._guards()
             specs = collect_args([g.fn for g in guards], self.dependency_overrides)
@@ -132,65 +223,7 @@ class Gate(Guards):
         elif executor is None:
             gate_dir = self.file.parent if self.file else root
             executor = WorkerExecutor(root=root, gate_dir=gate_dir, jobs=self.jobs)
-        base = replace(base, validated=validate)
-        return _finish(self._run(base, guards, values, executor, progress))
-
-    def _run(
-        self,
-        base: RunResult,
-        guards: list[Guard],
-        values: dict[str, Any],
-        executor: Executor,
-        progress: Callable[[str], None] | None,
-    ) -> RunResult:
-        results: list[GuardResult] = []
-        problems: list[str] = []
-        exit_code = 0
-        attempted = 0
-        current: str | None = None  # the guard being attempted, named if it is cut short
-        reset_stop()
-        stack = contextlib.ExitStack()
-        resolver = Resolver(values, self.dependency_overrides, stack)
-        try:
-            with using(executor):
-                for guard in guards:
-                    attempted += 1
-                    current = guard.name
-                    if progress:
-                        progress(guard.name)
-                    result, problem = self._guard(guard, resolver, executor)
-                    current = None
-                    if problem is not None:
-                        problems.append(problem)
-                        exit_code = 2
-                        break
-                    results.append(result)
-                    if not result.passed:
-                        exit_code = 1
-                        break
-        except KeyboardInterrupt:
-            kill_all()
-            exit_code = 130
-            problems.append(f"interrupted during guard {current!r}" if current else "interrupted")
-        except Propagate:
-            raise
-        except Exception as exc:
-            kill_all()
-            exit_code = 3
-            where = f" in guard {current!r}" if current else ""
-            problems.append(f"preflight failed{where} ({type(exc).__name__})")
-        finally:
-            stack.close()
-        problems.extend(resolver.cleanup_problems)
-        if resolver.cleanup_problems and exit_code == 0:
-            exit_code = 3
-        return replace(
-            base,
-            exit_code=exit_code,
-            guards=tuple(results),
-            not_run=tuple(g.name for g in guards[attempted:]),
-            problems=tuple(problems),
-        )
+        return _Prepared(replace(base, validated=validate), guards, values, executor)
 
     def _guard(
         self, guard: Guard, resolver: Resolver, executor: Executor
@@ -218,13 +251,7 @@ class Gate(Guards):
         return GuardResult(guard.name, tuple(CheckResult(label, o) for label, o in pairs)), None
 
     def _guards(self) -> list[Guard]:
-        guards = self.flatten()
-        if not guards:
-            raise GateDefinitionError([f"gate {self.name} has no guards"])
-        repeated = sorted(n for n, c in Counter(g.name for g in guards).items() if c > 1)
-        if repeated:
-            raise GateDefinitionError([f"guard name used twice: {n}" for n in repeated])
-        return guards
+        return _unique_guards(self, self.name)
 
     def _prog(self) -> str:
         return self.file.name if self.file else self.name
@@ -243,6 +270,133 @@ class Gate(Guards):
         if done.returncode != 0:
             raise GateDefinitionError([f"{self.file.name} is not inside a git work tree"])
         return Path(done.stdout.strip()).resolve()
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    base: RunResult
+    guards: list[Guard]
+    values: dict[str, Any]
+    executor: Executor
+
+
+class _Session:
+    """One run's live state: the executor in use, the resolver and its cleanup stack. execute()
+    opens and closes it around the guards; checked() keeps it open for the block."""
+
+    def __init__(self, gate: Gate, values: dict[str, Any], executor: Executor):
+        self.gate = gate
+        self.executor = executor
+        self.stack = contextlib.ExitStack()
+        self.resolver = Resolver(values, gate.dependency_overrides, self.stack)
+        self._using = using(executor)
+
+    def open(self) -> None:
+        reset_stop()
+        self._using.__enter__()
+
+    def close(self) -> None:
+        try:
+            self.stack.close()
+        finally:
+            self._using.__exit__(None, None, None)
+
+    def run_guards(
+        self, base: RunResult, guards: list[Guard], progress: Callable[[str], None] | None
+    ) -> RunResult:
+        results: list[GuardResult] = []
+        problems: list[str] = []
+        exit_code = 0
+        attempted = 0
+        current: str | None = None  # the guard being attempted, named if it is cut short
+        try:
+            for guard in guards:
+                attempted += 1
+                current = guard.name
+                if progress:
+                    progress(guard.name)
+                result, problem = self.gate._guard(guard, self.resolver, self.executor)
+                current = None
+                if problem is not None:
+                    problems.append(problem)
+                    exit_code = 2
+                    break
+                results.append(result)
+                if not result.passed:
+                    exit_code = 1
+                    break
+        except KeyboardInterrupt:
+            kill_all()
+            exit_code = 130
+            problems.append(f"interrupted during guard {current!r}" if current else "interrupted")
+        except Propagate:
+            raise
+        except Exception as exc:
+            kill_all()
+            exit_code = 3
+            where = f" in guard {current!r}" if current else ""
+            problems.append(f"preflight failed{where} ({type(exc).__name__})")
+        return replace(
+            base,
+            exit_code=exit_code,
+            guards=tuple(results),
+            not_run=tuple(g.name for g in guards[attempted:]),
+            problems=tuple(problems),
+        )
+
+
+class Run:
+    """The scope of a passed gate: its arguments, its providers, and verification afterwards."""
+
+    def __init__(self, gate: Gate, session: _Session, prepared: _Prepared):
+        self._gate = gate
+        self._session = session
+        self._prepared = prepared
+        self.args: Mapping[str, Any] = MappingProxyType(dict(prepared.values))
+
+    def __getitem__(self, provider: Callable[..., Any]) -> Any:
+        try:
+            return self._session.resolver.provide(provider)
+        except Unmet as exc:
+            name = exc.provider or getattr(provider, "__name__", "provider")
+            _emit(_unmet(self._prepared.base, exc, name))
+            raise SystemExit(1) from None
+        except ProviderFailed as exc:
+            print(f"{self._gate._prog()}: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
+    def verify(self, guards: Guards) -> None:
+        """Runs more guards in this scope; exits when one stops, returns when every one passed."""
+        flat = _unique_guards(guards, self._gate.name)
+        specs = collect_args([g.fn for g in flat], self._gate.dependency_overrides)
+        unknown = [spec.name for spec in specs if spec.name not in self.args]
+        if unknown:
+            raise GateDefinitionError(
+                [f"verify: argument {name} is not an argument of the gate" for name in unknown]
+            )
+        result = _finish(self._session.run_guards(self._prepared.base, flat, _progress))
+        _emit(result)
+        if result.exit_code != 0:
+            raise SystemExit(result.exit_code)
+
+
+def _unique_guards(guards: Guards, name: str) -> list[Guard]:
+    flat = guards.flatten()
+    if not flat:
+        raise GateDefinitionError([f"gate {name} has no guards"])
+    repeated = sorted(n for n, c in Counter(g.name for g in flat).items() if c > 1)
+    if repeated:
+        raise GateDefinitionError([f"guard name used twice: {n}" for n in repeated])
+    return flat
+
+
+def _progress(name: str) -> None:
+    print(f"… {name}", file=sys.stderr, flush=True)
+
+
+def _emit(result: RunResult) -> None:
+    sys.stdout.write(result.output)
+    sys.stdout.flush()
 
 
 @contextlib.contextmanager
@@ -277,6 +431,12 @@ def _labels(checks: Sequence[BoundCheck]) -> list[str]:
         else:
             labels.append(bound.label)
     return labels
+
+
+def _unmet(base: RunResult, exc: Unmet, name: str) -> RunResult:
+    """A worklist of one guard, `needs <name>`, carrying the unmet steps (exit 1)."""
+    guard = GuardResult(f"needs {name}", unmet=exc.items, unmet_by=name)
+    return _finish(replace(base, exit_code=1, guards=(guard,)))
 
 
 def _finish(result: RunResult) -> RunResult:
