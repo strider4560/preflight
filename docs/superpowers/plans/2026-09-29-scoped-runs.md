@@ -894,6 +894,7 @@ Either way the apply asks for approval, and the run ends with the bootstrap mile
 
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -1013,7 +1014,13 @@ def tofu(*args: str, run=subprocess.run) -> None:
     try:
         code = process.wait()
     except KeyboardInterrupt:
-        code = process.wait()
+        # Ctrl-C already reached tofu (same process group); a SIGTERM or SIGHUP to this program
+        # alone did not. Give tofu time to finish its own shutdown, then interrupt it ourselves.
+        try:
+            code = process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            process.send_signal(signal.SIGINT)
+            code = process.wait()
         raise
     if code != 0:
         raise subprocess.CalledProcessError(code, ["tofu", *args])
