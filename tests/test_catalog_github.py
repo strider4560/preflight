@@ -193,6 +193,18 @@ def test_names_are_validated(build):
 
 
 @pytest.mark.parametrize(
+    "build",
+    [
+        lambda: github.variables(repo="a/b", variables={}),
+        lambda: github.org_variables(org="a", variables={}),
+    ],
+)
+def test_empty_variables_are_refused_rather_than_passing(build):
+    with pytest.raises(CheckCallError, match="at least 1 item"):
+        build()
+
+
+@pytest.mark.parametrize(
     ("result", "error_type", "paste", "do_start"),
     [
         (FakeResult(127, "", "gh: not found"), "MissingTool", None, "Install the GitHub CLI"),

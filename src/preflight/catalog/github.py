@@ -204,12 +204,16 @@ def _variables(probe: Probe, base: str, flag: str, variables: dict[str, str]) ->
 
 
 @check(key="repo")
-def variables(probe: Probe, repo: Repo, variables: dict[Name, str]) -> Outcome:
+def variables(
+    probe: Probe, repo: Repo, variables: Annotated[dict[Name, str], Field(min_length=1)]
+) -> Outcome:
     return _variables(probe, f"repos/{repo}", f"--repo {shlex.quote(repo)}", variables)
 
 
 @check(key="org")
-def org_variables(probe: Probe, org: Owner, variables: dict[Name, str]) -> Outcome:
+def org_variables(
+    probe: Probe, org: Owner, variables: Annotated[dict[Name, str], Field(min_length=1)]
+) -> Outcome:
     return _variables(probe, f"orgs/{org}", f"--org {shlex.quote(org)}", variables)
 
 

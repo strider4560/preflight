@@ -62,8 +62,17 @@ def test_no_delegation_and_no_zone_and_unavailable(tmp_path):
     assert items["new"].status is Status.FAIL
 
 
-def test_no_zones_is_ok(tmp_path):
-    assert run(delegation(zones=()), tmp_path, FakeDns()).status is Status.OK
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: dns.delegated(root="tellabs.dev", name_servers={}),
+        lambda: dns.undelegated(root="tellabs.dev", zones=[]),
+        lambda: dns.cname(records=[]),
+    ],
+)
+def test_empty_inputs_are_refused_rather_than_passing(build):
+    with pytest.raises(CheckCallError, match="at least 1 item"):
+        build()
 
 
 def test_undelegated(tmp_path):

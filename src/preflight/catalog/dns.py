@@ -57,7 +57,11 @@ def _unavailable(key: str | None, parent: str, advisory: bool = False) -> Item:
 
 
 @check(key="root")
-def delegated(probe: Probe, root: Domain, name_servers: dict[Label, list[Domain]]) -> Outcome:
+def delegated(
+    probe: Probe,
+    root: Domain,
+    name_servers: Annotated[dict[Label, list[Domain]], Field(min_length=1)],
+) -> Outcome:
     root = norm(root)
     items = []
     for prefix, servers in name_servers.items():
@@ -94,7 +98,9 @@ def delegated(probe: Probe, root: Domain, name_servers: dict[Label, list[Domain]
 
 
 @check(key="root")
-def undelegated(probe: Probe, root: Domain, zones: Zones) -> Outcome:
+def undelegated(
+    probe: Probe, root: Domain, zones: Annotated[Zones, Field(min_length=1)]
+) -> Outcome:
     root = norm(root)
     items = []
     for prefix in zones:
@@ -121,7 +127,7 @@ def undelegated(probe: Probe, root: Domain, zones: Zones) -> Outcome:
 
 
 @check
-def cname(probe: Probe, records: Records) -> Outcome:
+def cname(probe: Probe, records: Annotated[Records, Field(min_length=1)]) -> Outcome:
     items = []
     for record in records:
         name, target = norm(record.name), norm(record.target)
