@@ -80,6 +80,28 @@ if __name__ == "__main__":
   `Path(__file__)` (for example `ROOT = Path(__file__).resolve().parent.parent`), not from the
   working directory.
 
+## A program that acts after its guards
+
+A gate that is also the action, such as an account bootstrap, uses a scoped run:
+
+```python
+if __name__ == "__main__":
+    with gate.checked(sys.argv[1:]) as run:
+        env, plan = run.args["env"], run[state_plan]
+        apply(env, plan)                  # the program's own work; preflight never runs it
+        run.verify(published)             # post-condition guards
+```
+
+`checked` runs the guards and enters the block only when every one passed (otherwise it prints
+the worklist and exits as `run()` would; under `--validate` it exits 0 without entering).
+Inside, the providers are still alive: `run.args` holds the parsed arguments, `run[provider]`
+a provider's value, and `run.verify(guards)` runs more guards, exiting 1 if one stops. Leaving
+the block runs the providers' cleanup however it ends: a `SystemExit` keeps its code, Ctrl-C or
+SIGTERM exits 130, and any other exception is the program's own failure, exit 2 with the type.
+A provider that decides on a fact reads it from a check: `observed(probe_now(s3.bucket_status(
+name, identity=identity)))` returns the item's observed value, or raises `Unmet` when the check
+could not observe it.
+
 ## Your own checks
 
 ```python

@@ -13,7 +13,7 @@ from preflight.check import (  # noqa: E402
     check,
     unique_by,
 )
-from preflight.gate import Gate, Guards  # noqa: E402
+from preflight.gate import Gate, Guards, Run  # noqa: E402
 from preflight.outcome import (  # noqa: E402
     Item,
     NextStep,
@@ -25,7 +25,7 @@ from preflight.outcome import (  # noqa: E402
     outcome,
     pending,
 )
-from preflight.params import Arg, Depends, Unmet  # noqa: E402
+from preflight.params import Arg, Depends, Unmet, observed  # noqa: E402
 from preflight.probe import Probe  # noqa: E402
 from preflight.runner import probe_now  # noqa: E402
 
@@ -43,12 +43,14 @@ __all__ = [
     "NextStep",
     "Outcome",
     "Probe",
+    "Run",
     "Status",
     "UniqueList",
     "Unmet",
     "check",
     "error",
     "fail",
+    "observed",
     "ok",
     "outcome",
     "pending",

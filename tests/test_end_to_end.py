@@ -212,3 +212,62 @@ def test_sigterm_kills_workers_cleans_up_and_exits_130(repo):
     assert "interrupted during guard 'waits'" in stdout
     assert (repo / "cleanup.log").read_text() == "cleaned"
     _wait_for(lambda: _gone(worker), 3)
+
+
+PROGRAM = """
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Annotated, Literal
+
+from preflight import Arg, Depends, Gate, Guards, Outcome, Probe, check, fail, ok, outcome
+from preflight.catalog import files
+
+Env = Annotated[Literal["dev", "prod"], Arg()]
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def session(env: Env) -> Iterator[str]:
+    yield env
+    (ROOT / "cleanup.log").write_text(env)
+
+
+gate = Gate("program")
+
+
+@gate.guard("readme present")
+def readme(held: Annotated[str, Depends(session)]):
+    return [files.present(paths=["README.md"])]
+
+
+after = Guards()
+
+
+@after.guard("marker written")
+def marker():
+    return [files.present(paths=["MARKER"])]
+
+
+if __name__ == "__main__":
+    with gate.checked(sys.argv[1:]) as run:
+        (ROOT / "MARKER").write_text(run[session])
+        run.verify(after)
+"""
+
+
+def test_a_program_acts_after_its_guards_and_verifies(repo):
+    program = write(repo, "gate/program.py", PROGRAM)
+    write(repo, "README.md", "x\n")
+    result = run(program, "dev", cwd=repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / "MARKER").read_text() == "dev"
+    assert (repo / "cleanup.log").read_text() == "dev"
+    assert result.stdout.count("Every guard passed.") == 2
+
+
+def test_a_program_never_acts_when_a_guard_stops(repo):
+    program = write(repo, "gate/program.py", PROGRAM)
+    result = run(program, "dev", cwd=repo)
+    assert result.returncode == 1
+    assert not (repo / "MARKER").exists()
+    assert "Create README.md." in result.stdout

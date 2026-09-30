@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 import pytest
 
-from preflight.outcome import fail, outcome
+from preflight.outcome import fail, ok, outcome
 from preflight.params import (
     EMPTY,
     Arg,
@@ -16,6 +16,7 @@ from preflight.params import (
     Resolver,
     Unmet,
     collect_args,
+    observed,
     parameters_of,
     parse_args,
 )
@@ -237,3 +238,13 @@ def test_option_abbreviations_are_refused():
     with pytest.raises(SystemExit) as exc:
         parse_args("gate.py", SPECS, ["dev", "--val"])
     assert exc.value.code == 2
+
+
+def test_observed_reads_an_ok_items_value_or_raises_unmet():
+    assert observed(outcome(ok(observed="present"))) == "present"
+    assert observed(outcome(ok("a", observed=1), ok("b", observed=2)), key="b") == 2
+    with pytest.raises(Unmet) as exc:
+        observed(outcome(fail(do="Could not look.")))
+    assert exc.value.items[0].next_step.do == "Could not look."
+    with pytest.raises(KeyError):
+        observed(outcome(ok("a")), key="zzz")
